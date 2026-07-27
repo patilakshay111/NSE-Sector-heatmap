@@ -215,6 +215,87 @@ function renderStockGroups(groups) {
   }).join("");
 }
 
+function tradeSideClass(side) {
+  return side === "BUY" ? "good" : "bad";
+}
+
+function renderPaperTrading(paper) {
+  const data = paper || {};
+  const ideas = data.ideas || [];
+  const activeTrades = data.openTrades || data.activeTrades || [];
+  const closedTrades = data.closedTrades || [];
+
+  q("#p-initial").textContent = fmt(data.initialCapital, 0);
+  q("#p-available").textContent = fmt(data.availableCapital, 0);
+  q("#p-allocated").textContent = fmt(data.allocatedCapital, 0);
+  q("#p-unrealized").textContent = fmt(data.unrealizedPnl);
+  q("#p-unrealized").className = changeClass(data.unrealizedPnl);
+  q("#p-realized").textContent = fmt(data.realizedPnl);
+  q("#p-realized").className = changeClass(data.realizedPnl);
+  q("#p-active-count").textContent = data.activeCount ?? "-";
+  q("#p-saved").textContent = data.persistenceError ? "Save error" : data.lastSavedAt || "-";
+  q("#p-saved").className = data.persistenceError ? "bad" : "";
+  q("#p-idea-count").textContent = data.sessionOpen ? `${ideas.length} ideas` : data.sessionStatus || "Waiting for session";
+  q("#p-closed-count").textContent = `${data.closedCount || 0} closed`;
+
+  q("#paper-ideas-body").innerHTML = data.persistenceError ? `<tr><td colspan="11" class="empty-state bad">${safe(data.persistenceError)}</td></tr>` : ideas.length ? ideas.map((idea) => `
+    <tr class="${idea.ready ? "ready-row" : ""}">
+      <td>
+        <strong>${safe(idea.symbol)}</strong>
+        <span>${safe(idea.sector)}</span>
+      </td>
+      <td class="${tradeSideClass(idea.side)}">${safe(idea.side)}</td>
+      <td>
+        <strong>${safe(idea.thesis)}</strong>
+        <span>${safe(idea.m5?.startedAt || "-")} / O ${fmt(idea.m5?.open)} C ${fmt(idea.m5?.close)}</span>
+      </td>
+      <td>${fmt(idea.quantity, 0)}</td>
+      <td>${fmt(idea.entry)}</td>
+      <td>${fmt(idea.stopLoss)}</td>
+      <td>${fmt(idea.target)}</td>
+      <td>${fmt(idea.rr)}</td>
+      <td class="bad">${fmt(idea.lossIfSl)}</td>
+      <td class="good">${fmt(idea.profitIfTp)}</td>
+      <td><span class="status-pill ${idea.ready ? "ready" : ""}">${safe(idea.status)}</span></td>
+    </tr>
+  `).join("") : `<tr><td colspan="11" class="empty-state">${safe(data.sessionStatus || "Waiting for selected stocks and M5 candles.")}</td></tr>`;
+
+  q("#active-trades-body").innerHTML = activeTrades.length ? activeTrades.map((trade) => `
+    <tr>
+      <td>
+        <strong>${safe(trade.id)}</strong>
+        <span>${safe(trade.entryTime || trade.openedAt)}</span>
+      </td>
+      <td>${safe(trade.symbol)}</td>
+      <td class="${tradeSideClass(trade.side)}">${safe(trade.side)}</td>
+      <td>${safe(trade.thesis)}</td>
+      <td>${fmt(trade.quantity, 0)}</td>
+      <td>${safe(trade.entryTime || trade.openedAt)}</td>
+      <td>${fmt(trade.entry)}</td>
+      <td>${fmt(trade.currentPrice)}</td>
+      <td>${fmt(trade.stopLoss)}</td>
+      <td>${fmt(trade.target)}</td>
+      <td>${fmt(trade.currentRr ?? trade.rr)}</td>
+      <td class="${changeClass(trade.unrealizedPnl)}">${fmt(trade.unrealizedPnl)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"12\" class=\"empty-state\">No active paper trades yet.</td></tr>";
+
+  q("#closed-trades-body").innerHTML = closedTrades.length ? closedTrades.map((trade) => `
+    <tr>
+      <td>${safe(trade.id)}</td>
+      <td>${safe(trade.symbol)}</td>
+      <td class="${tradeSideClass(trade.side)}">${safe(trade.side)}</td>
+      <td>${safe(trade.exitReason)}</td>
+      <td>${fmt(trade.quantity, 0)}</td>
+      <td>${safe(trade.entryTime || trade.openedAt)}</td>
+      <td>${safe(trade.exitTime || trade.closedAt)}</td>
+      <td>${fmt(trade.entry)}</td>
+      <td>${fmt(trade.exitPrice)}</td>
+      <td class="${changeClass(trade.realizedPnl)}">${fmt(trade.realizedPnl)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"10\" class=\"empty-state\">No closed paper trades yet.</td></tr>";
+}
+
 function renderSettings(status) {
   const source = q("#source-url");
   source.textContent = status.source_url || "-";
@@ -248,6 +329,7 @@ function renderStatus(status) {
   renderHeatmap(rows);
   renderTable(rows);
   renderStockGroups(status.sector_stock_groups || []);
+  renderPaperTrading(status.paper_trading || {});
   renderSettings(status);
 }
 

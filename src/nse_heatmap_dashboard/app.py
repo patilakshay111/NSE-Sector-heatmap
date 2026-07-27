@@ -16,6 +16,8 @@ import webbrowser
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC_ROOT = Path(__file__).resolve().parent / "static"
+DATA_ROOT = ROOT / "data"
+PAPER_STATE_PATH = DATA_ROOT / "paper_trading_state.json"
 
 NSE_HOME = "https://www.nseindia.com"
 NSE_HEATMAP_URL = f"{NSE_HOME}/market-data/live-market-indices/heatmap"
@@ -26,6 +28,12 @@ NSE_QUOTE_EQUITY_API = f"{NSE_HOME}/api/quote-equity"
 POLL_SECONDS = 30
 SECTOR_PICK_COUNT = 2
 STOCKS_PER_SECTOR = 5
+PAPER_INITIAL_CAPITAL = 1_000_000.0
+PAPER_TRADE_ALLOCATION = 50_000.0
+M5_SECONDS = 300
+VWAP_RETEST_TOLERANCE = 0.003
+PAPER_START_HOUR = 9
+PAPER_START_MINUTE = 20
 
 SECTOR_KEYWORDS = {
     "AUTO",
@@ -172,6 +180,449 @@ def _stock_row(
     }
 
 
+def _round_price(value: float | None) -> float | None:
+    return round(value, 2) if value is not None else None
+
+
+def _risk_reward(side: str, entry: float, stop_loss: float, target: float) -> float | None:
+    if side == "BUY":
+        risk = entry - stop_loss
+        reward = target - entry
+    else:
+        risk = stop_loss - entry
+        reward = entry - target
+    if risk <= 0 or reward <= 0:
+        return None
+    return reward / risk
+
+
+def _trade_pnl(side: str, entry: float, price: float, quantity: int) -> float:
+    if side == "BUY":
+        return (price - entry) * quantity
+    return (entry - price) * quantity
+
+
+class PaperTradingEngine:
+    def __init__(self) -> None:
+        self.initial_capital = PAPER_INITIAL_CAPITAL
+        self.trade_allocation = PAPER_TRADE_ALLOCATION
+        self.realized_pnl = 0.0
+        self.candles: dict[str, list[dict[str, Any]]] = {}
+        self.active_trades: dict[str, dict[str, Any]] = {}
+        self.closed_trades: list[dict[str, Any]] = []
+        self.fib_watch: dict[str, dict[str, Any]] = {}
+        self.next_trade_id = 1
+        self.last_ideas: list[dict[str, Any]] = []
+        self.last_saved_at: str | None = None
+        self.persistence_error: str | None = None
+        self._load()
+
+    def update(self, stock_groups: list[dict[str, Any]]) -> dict[str, Any]:
+        stocks = self._selected_stocks(stock_groups)
+        now = time.time()
+        session_open = self._session_is_open(now)
+        if not session_open:
+            self.last_ideas = []
+            self._persist()
+            return self.snapshot()
+        for stock in stocks:
+            self._update_candle(stock, now)
+        self._mark_active_trades(stocks)
+        ideas = self._build_ideas(stocks)
+        self._activate_ready_ideas(ideas)
+        self._mark_active_trades(stocks)
+        self.last_ideas = ideas
+        self._persist()
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        active = list(self.active_trades.values())
+        active_allocated = sum(trade["allocation"] for trade in active)
+        unrealized_pnl = sum(trade.get("unrealizedPnl") or 0 for trade in active)
+        equity = self.initial_capital + self.realized_pnl + unrealized_pnl
+        return {
+            "initialCapital": self.initial_capital,
+            "allocationPerTrade": self.trade_allocation,
+            "availableCapital": self.initial_capital + self.realized_pnl - active_allocated,
+            "allocatedCapital": active_allocated,
+            "realizedPnl": self.realized_pnl,
+            "unrealizedPnl": unrealized_pnl,
+            "equity": equity,
+            "activeCount": len(active),
+            "closedCount": len(self.closed_trades),
+            "ideaCount": len(self.last_ideas),
+            "sessionOpen": self._session_is_open(),
+            "sessionStart": f"{PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d}",
+            "sessionStatus": self._session_status(),
+            "lastSavedAt": self.last_saved_at,
+            "persistencePath": str(PAPER_STATE_PATH),
+            "persistenceError": self.persistence_error,
+            "ideas": self.last_ideas,
+            "openTrades": active,
+            "activeTrades": active,
+            "closedTrades": self.closed_trades[-12:],
+        }
+
+    def _load(self) -> None:
+        if not PAPER_STATE_PATH.exists():
+            return
+        try:
+            payload = json.loads(PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            self.initial_capital = _to_float(payload.get("initialCapital")) or PAPER_INITIAL_CAPITAL
+            self.trade_allocation = _to_float(payload.get("allocationPerTrade")) or PAPER_TRADE_ALLOCATION
+            self.realized_pnl = _to_float(payload.get("realizedPnl")) or 0.0
+            self.candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else {}
+            self.fib_watch = payload.get("fibWatch") if isinstance(payload.get("fibWatch"), dict) else {}
+            open_trades = payload.get("openTrades") or payload.get("activeTrades")
+            self.active_trades = open_trades if isinstance(open_trades, dict) else {}
+            self.closed_trades = payload.get("closedTrades") if isinstance(payload.get("closedTrades"), list) else []
+            self._normalize_loaded_trades()
+            self.last_ideas = payload.get("ideas") if isinstance(payload.get("ideas"), list) else []
+            self.next_trade_id = int(payload.get("nextTradeId") or self._next_trade_id_from_history())
+            self.last_saved_at = payload.get("lastSavedAt") or payload.get("savedAt")
+            self.persistence_error = None
+        except Exception as exc:  # noqa: BLE001 - keep dashboard usable and surface persistence trouble
+            self.persistence_error = f"Could not load paper trading state: {exc}"
+
+    def _persist(self) -> None:
+        payload = {
+            "schemaVersion": 1,
+            "savedAt": _now_label(),
+            "initialCapital": self.initial_capital,
+            "allocationPerTrade": self.trade_allocation,
+            "realizedPnl": self.realized_pnl,
+            "nextTradeId": self.next_trade_id,
+            "candles": self.candles,
+            "fibWatch": self.fib_watch,
+            "openTrades": self.active_trades,
+            "activeTrades": self.active_trades,
+            "closedTrades": self.closed_trades,
+            "ideas": self.last_ideas,
+        }
+        try:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            temp_path = PAPER_STATE_PATH.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            temp_path.replace(PAPER_STATE_PATH)
+            self.last_saved_at = payload["savedAt"]
+            self.persistence_error = None
+        except Exception as exc:  # noqa: BLE001 - surface persistence trouble to the UI
+            self.persistence_error = f"Could not save paper trading state: {exc}"
+
+    def _next_trade_id_from_history(self) -> int:
+        max_id = 0
+        trades = [*self.active_trades.values(), *self.closed_trades]
+        for trade in trades:
+            text = str(trade.get("id") or "")
+            if text.startswith("PT") and text[2:].isdigit():
+                max_id = max(max_id, int(text[2:]))
+        return max_id + 1
+
+    def _normalize_loaded_trades(self) -> None:
+        for trade in self.active_trades.values():
+            trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
+            trade["openedAt"] = trade["entryTime"]
+            trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+        for trade in self.closed_trades:
+            trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
+            trade["openedAt"] = trade["entryTime"]
+            trade["exitTime"] = trade.get("exitTime") or trade.get("closedAt") or "-"
+            trade["closedAt"] = trade["exitTime"]
+            trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+
+    @staticmethod
+    def _session_is_open(now: float | None = None) -> bool:
+        local_time = time.localtime(now or time.time())
+        if local_time.tm_hour > PAPER_START_HOUR:
+            return True
+        return local_time.tm_hour == PAPER_START_HOUR and local_time.tm_min >= PAPER_START_MINUTE
+
+    def _session_status(self) -> str:
+        if self._session_is_open():
+            return "Paper engine active"
+        return f"Waiting until {PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d} to start paper trading"
+
+    @staticmethod
+    def _selected_stocks(stock_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        stocks = []
+        for group in stock_groups:
+            for stock in group.get("stocks") or []:
+                merged = {**stock, "sector": group.get("sector") or stock.get("sector"), "direction": group.get("direction") or stock.get("direction")}
+                if merged.get("symbol") and _to_float(merged.get("current")) is not None:
+                    stocks.append(merged)
+        return stocks
+
+    def _update_candle(self, stock: dict[str, Any], now: float) -> None:
+        symbol = stock["symbol"]
+        price = _to_float(stock.get("current"))
+        if price is None:
+            return
+        bucket = int(now // M5_SECONDS) * M5_SECONDS
+        candles = self.candles.setdefault(symbol, [])
+        if not candles or candles[-1]["bucket"] != bucket:
+            candles.append(
+                {
+                    "bucket": bucket,
+                    "startedAt": time.strftime("%H:%M:%S", time.localtime(bucket)),
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "ticks": 1,
+                }
+            )
+            del candles[:-12]
+            return
+        candle = candles[-1]
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+        candle["ticks"] += 1
+
+    def _latest_candle(self, symbol: str) -> dict[str, Any] | None:
+        candles = self.candles.get(symbol) or []
+        return candles[-1] if candles else None
+
+    def _build_ideas(self, stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        ideas = []
+        for stock in stocks:
+            side = "BUY" if stock.get("direction") == "gain" else "SHORT"
+            ideas.append(self._vwap_idea(stock, side))
+            ideas.append(self._fib_idea(stock, side))
+        return [idea for idea in ideas if idea]
+
+    def _vwap_idea(self, stock: dict[str, Any], side: str) -> dict[str, Any] | None:
+        price = _to_float(stock.get("current"))
+        vwap = _to_float(stock.get("vwap"))
+        day_high = _to_float(stock.get("high"))
+        day_low = _to_float(stock.get("low"))
+        candle = self._latest_candle(stock["symbol"])
+        if price is None or vwap is None or day_high is None or day_low is None or not candle:
+            return None
+        retest = abs(price - vwap) / vwap <= VWAP_RETEST_TOLERANCE
+        confirm = self._candle_confirms(candle, side)
+        entry, stop_loss, target = self._levels(side, price, day_low, day_high, candle)
+        return self._idea(
+            stock,
+            side,
+            "VWAP M5 Retest",
+            "Price retraces to VWAP, then a 5-minute confirmation candle triggers the trade.",
+            entry,
+            stop_loss,
+            target,
+            retest and confirm,
+            "Ready: VWAP retest with M5 confirmation"
+            if retest and confirm
+            else "Waiting for VWAP retest"
+            if not retest
+            else f"Waiting for M5 {'bullish' if side == 'BUY' else 'bearish'} candle",
+            candle,
+        )
+
+    def _fib_idea(self, stock: dict[str, Any], side: str) -> dict[str, Any] | None:
+        price = _to_float(stock.get("current"))
+        day_high = _to_float(stock.get("high"))
+        day_low = _to_float(stock.get("low"))
+        candle = self._latest_candle(stock["symbol"])
+        if price is None or day_high is None or day_low is None or day_high <= day_low or not candle:
+            return None
+        zone_low, zone_high = self._fib_zone(side, day_low, day_high)
+        in_zone = zone_low <= price <= zone_high
+        key = f"{stock['symbol']}|{side}|FIB"
+        watch = self.fib_watch.get(key)
+        if in_zone and not watch:
+            watch = {"seenAt": _now_label()}
+            self.fib_watch[key] = watch
+        if not in_zone and watch and self._price_invalidates_fib(side, price, day_low, day_high):
+            self.fib_watch.pop(key, None)
+            watch = None
+        confirm = bool(watch) and self._candle_confirms(candle, side)
+        entry, stop_loss, target = self._levels(side, price, day_low, day_high, candle)
+        status = "Ready: Fib zone held and next M5 candle confirmed" if confirm else f"Waiting for 38.2-61.8% retracement ({_round_price(zone_low)}-{_round_price(zone_high)})"
+        if watch and not confirm:
+            status = f"Fib zone touched at {watch['seenAt']}; waiting for next M5 confirmation"
+        return self._idea(
+            stock,
+            side,
+            "Fib Retracement Confirm",
+            "Price enters the 38.2-61.8% intraday retracement zone, then the next 5-minute candle confirms.",
+            entry,
+            stop_loss,
+            target,
+            confirm,
+            status,
+            candle,
+            {"zoneLow": zone_low, "zoneHigh": zone_high},
+        )
+
+    def _idea(
+        self,
+        stock: dict[str, Any],
+        side: str,
+        thesis: str,
+        thesisDetail: str,
+        entry: float,
+        stop_loss: float,
+        target: float,
+        ready: bool,
+        status: str,
+        candle: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        quantity = max(1, int(self.trade_allocation // entry)) if entry > 0 else 0
+        rr = _risk_reward(side, entry, stop_loss, target)
+        loss_if_sl = abs(_trade_pnl(side, entry, stop_loss, quantity))
+        profit_if_tp = max(0.0, _trade_pnl(side, entry, target, quantity))
+        active_key = self._trade_key(stock["symbol"], thesis)
+        idea = {
+            "symbol": stock["symbol"],
+            "sector": stock.get("sector") or "-",
+            "side": side,
+            "thesis": thesis,
+            "thesisDetail": thesisDetail,
+            "entry": _round_price(entry),
+            "stopLoss": _round_price(stop_loss),
+            "target": _round_price(target),
+            "currentPrice": _round_price(entry),
+            "rr": round(rr, 2) if rr is not None else None,
+            "lossIfSl": _round_price(loss_if_sl),
+            "profitIfTp": _round_price(profit_if_tp),
+            "allocation": self.trade_allocation,
+            "quantity": quantity,
+            "ready": bool(ready and rr is not None and quantity > 0 and active_key not in self.active_trades),
+            "status": "Already active" if active_key in self.active_trades else status,
+            "m5": {
+                "open": _round_price(candle["open"]),
+                "high": _round_price(candle["high"]),
+                "low": _round_price(candle["low"]),
+                "close": _round_price(candle["close"]),
+                "ticks": candle["ticks"],
+                "startedAt": candle["startedAt"],
+            },
+        }
+        if extra:
+            idea.update({key: _round_price(value) if isinstance(value, float) else value for key, value in extra.items()})
+        return idea
+
+    @staticmethod
+    def _candle_confirms(candle: dict[str, Any], side: str) -> bool:
+        if candle.get("ticks", 0) < 2:
+            return False
+        if side == "BUY":
+            return candle["close"] > candle["open"]
+        return candle["close"] < candle["open"]
+
+    @staticmethod
+    def _levels(side: str, price: float, day_low: float, day_high: float, candle: dict[str, Any]) -> tuple[float, float, float]:
+        buffer = max(price * 0.001, 0.05)
+        if side == "BUY":
+            return price, candle["low"] - buffer, day_high
+        return price, candle["high"] + buffer, day_low
+
+    @staticmethod
+    def _fib_zone(side: str, day_low: float, day_high: float) -> tuple[float, float]:
+        span = day_high - day_low
+        if side == "BUY":
+            lower = day_high - (span * 0.618)
+            upper = day_high - (span * 0.382)
+        else:
+            lower = day_low + (span * 0.382)
+            upper = day_low + (span * 0.618)
+        return min(lower, upper), max(lower, upper)
+
+    @staticmethod
+    def _price_invalidates_fib(side: str, price: float, day_low: float, day_high: float) -> bool:
+        return price < day_low if side == "BUY" else price > day_high
+
+    def _activate_ready_ideas(self, ideas: list[dict[str, Any]]) -> None:
+        for idea in ideas:
+            if not idea.get("ready"):
+                continue
+            if self.snapshot()["availableCapital"] < self.trade_allocation:
+                idea["ready"] = False
+                idea["status"] = "Ready but capital is fully allocated"
+                continue
+            trade = self._trade_from_idea(idea)
+            self.active_trades[trade["key"]] = trade
+            idea["status"] = "Trade placed"
+            idea["ready"] = False
+
+    def _trade_from_idea(self, idea: dict[str, Any]) -> dict[str, Any]:
+        trade_id = f"PT{self.next_trade_id:04d}"
+        self.next_trade_id += 1
+        entry_time = _now_label()
+        return {
+            "id": trade_id,
+            "key": self._trade_key(idea["symbol"], idea["thesis"]),
+            "symbol": idea["symbol"],
+            "sector": idea["sector"],
+            "side": idea["side"],
+            "thesis": idea["thesis"],
+            "entry": idea["entry"],
+            "stopLoss": idea["stopLoss"],
+            "target": idea["target"],
+            "quantity": idea["quantity"],
+            "allocation": self.trade_allocation,
+            "currentPrice": idea["currentPrice"],
+            "rr": idea["rr"],
+            "lossIfSl": idea["lossIfSl"],
+            "profitIfTp": idea["profitIfTp"],
+            "unrealizedPnl": 0.0,
+            "entryTime": entry_time,
+            "openedAt": entry_time,
+            "status": "ACTIVE",
+        }
+
+    @staticmethod
+    def _trade_key(symbol: str, thesis: str) -> str:
+        return f"{symbol}|{thesis}"
+
+    def _mark_active_trades(self, stocks: list[dict[str, Any]]) -> None:
+        by_symbol = {stock["symbol"]: stock for stock in stocks}
+        for key, trade in list(self.active_trades.items()):
+            stock = by_symbol.get(trade["symbol"])
+            if not stock:
+                continue
+            price = _to_float(stock.get("current"))
+            if price is None:
+                continue
+            trade["currentPrice"] = _round_price(price)
+            trade["unrealizedPnl"] = _round_price(_trade_pnl(trade["side"], trade["entry"], price, trade["quantity"]))
+            rr = _risk_reward(trade["side"], price, trade["stopLoss"], trade["target"])
+            trade["currentRr"] = round(rr, 2) if rr is not None else None
+            exit_reason = None
+            exit_price = None
+            if trade["side"] == "BUY":
+                if price <= trade["stopLoss"]:
+                    exit_reason, exit_price = "SL", trade["stopLoss"]
+                elif price >= trade["target"]:
+                    exit_reason, exit_price = "TP", trade["target"]
+            else:
+                if price >= trade["stopLoss"]:
+                    exit_reason, exit_price = "SL", trade["stopLoss"]
+                elif price <= trade["target"]:
+                    exit_reason, exit_price = "TP", trade["target"]
+            if exit_reason:
+                self._close_trade(key, trade, exit_reason, exit_price)
+
+    def _close_trade(self, key: str, trade: dict[str, Any], exit_reason: str, exit_price: float) -> None:
+        pnl = _trade_pnl(trade["side"], trade["entry"], exit_price, trade["quantity"])
+        self.realized_pnl += pnl
+        exit_time = _now_label()
+        closed = {
+            **trade,
+            "exitReason": exit_reason,
+            "exitPrice": _round_price(exit_price),
+            "realizedPnl": _round_price(pnl),
+            "entryTime": trade.get("entryTime") or trade.get("openedAt") or "-",
+            "closedAt": exit_time,
+            "exitTime": exit_time,
+            "status": exit_reason,
+        }
+        self.closed_trades.append(closed)
+        self.active_trades.pop(key, None)
+
+
 class NSEClient:
     def __init__(self) -> None:
         self.cookies = cookiejar.CookieJar()
@@ -250,6 +701,7 @@ class FeedState:
     fetch_count: int = 0
     sector_rows: list[dict[str, Any]] = field(default_factory=list)
     sector_stock_groups: list[dict[str, Any]] = field(default_factory=list)
+    paper_trading: dict[str, Any] = field(default_factory=dict)
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
     market_status: dict[str, Any] = field(default_factory=dict)
@@ -260,6 +712,7 @@ class FeedState:
 class NSEStreamer:
     def __init__(self) -> None:
         self.client = NSEClient()
+        self.paper_engine = PaperTradingEngine()
         self.state = FeedState()
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -308,12 +761,14 @@ class NSEStreamer:
             payload = self.client.fetch_all_indices()
             parsed = self._parse_payload(payload)
             stock_groups = self._fetch_sector_stock_groups(parsed["sector_rows"])
+            paper_trading = self.paper_engine.update(stock_groups)
             with self.lock:
                 self.state.last_error = None
                 self.state.last_success_at = _now_label()
                 self.state.fetch_count += 1
                 self.state.sector_rows = parsed["sector_rows"]
                 self.state.sector_stock_groups = stock_groups
+                self.state.paper_trading = paper_trading
                 self.state.max_gainer = parsed["max_gainer"]
                 self.state.max_loser = parsed["max_loser"]
                 self.state.market_status = parsed["market_status"]

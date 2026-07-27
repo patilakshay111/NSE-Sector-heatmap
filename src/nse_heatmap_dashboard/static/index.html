@@ -27,6 +27,7 @@
       <button class="nav" data-view="heatmap">Sector Heatmap</button>
       <button class="nav" data-view="indices">All Sectors</button>
       <button class="nav" data-view="sector-stocks">Sector Stocks</button>
+      <button class="nav" data-view="paper-trades">Paper Trades</button>
       <button class="nav" data-view="settings">Settings</button>
     </nav>
   </aside>
@@ -111,6 +112,69 @@
         <article class="metric"><span>Selection Rule</span><strong>Top 2 / Bottom 2</strong></article>
       </div>
       <div id="stock-groups" class="stock-groups"></div>
+    </section>
+
+    <section id="paper-trades" class="view">
+      <div class="paper-summary">
+        <article class="metric"><span>Initial Capital</span><strong id="p-initial">-</strong></article>
+        <article class="metric"><span>Available</span><strong id="p-available">-</strong></article>
+        <article class="metric"><span>Allocated</span><strong id="p-allocated">-</strong></article>
+        <article class="metric"><span>Unrealized P/L</span><strong id="p-unrealized">-</strong></article>
+        <article class="metric"><span>Realized P/L</span><strong id="p-realized">-</strong></article>
+        <article class="metric"><span>Active Trades</span><strong id="p-active-count">-</strong></article>
+        <article class="metric"><span>Last Saved</span><strong id="p-saved">-</strong></article>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Trade Ideas</h2>
+          <span id="p-idea-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Stock</th><th>Side</th><th>Thesis</th><th>Qty</th><th>Entry</th><th>SL</th><th>TP</th><th>RR</th><th>Loss if SL</th><th>Profit if TP</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="paper-ideas-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Active Trades</h2>
+          <span>50,000 allocation</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Stock</th><th>Side</th><th>Thesis</th><th>Qty</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current RR</th><th>P/L</th>
+              </tr>
+            </thead>
+            <tbody id="active-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Closed Trades</h2>
+          <span id="p-closed-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Stock</th><th>Side</th><th>Exit</th><th>Qty</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit Price</th><th>Realized P/L</th>
+              </tr>
+            </thead>
+            <tbody id="closed-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
     </section>
 
     <section id="settings" class="view">

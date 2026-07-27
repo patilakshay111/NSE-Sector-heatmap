@@ -212,6 +212,13 @@ button.danger {
   margin-bottom: 14px;
 }
 
+.paper-summary {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(130px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
 .metric,
 .panel,
 .leader,
@@ -387,6 +394,30 @@ button.danger {
   overflow-x: auto;
 }
 
+.paper-panel {
+  margin-bottom: 14px;
+}
+
+.ready-row {
+  background: color-mix(in srgb, var(--heat-good), var(--panel) 92%);
+}
+
+.status-pill {
+  display: inline-block;
+  max-width: 260px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--muted);
+  white-space: normal;
+}
+
+.status-pill.ready {
+  border-color: var(--heat-good);
+  color: var(--good);
+  font-weight: 700;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -450,6 +481,7 @@ th {
 @media (max-width: 1100px) {
   .metric-grid,
   .stock-summary,
+  .paper-summary,
   .sector-heatmap {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -472,6 +504,7 @@ th {
   .metric-grid,
   .leader-grid,
   .stock-summary,
+  .paper-summary,
   .sector-heatmap {
     grid-template-columns: 1fr;
   }
