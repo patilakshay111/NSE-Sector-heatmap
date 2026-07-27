@@ -1,0 +1,1 @@
+"""Local NSE heatmap dashboard."""

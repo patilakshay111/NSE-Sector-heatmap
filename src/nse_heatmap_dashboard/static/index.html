@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NSE Heatmap Dashboard</title>
+  <script>
+    (function () {
+      var theme = localStorage.getItem("theme");
+      if (!theme && window.matchMedia("(prefers-color-scheme: dark)").matches) theme = "dark";
+      if (theme === "dark") document.documentElement.dataset.theme = "dark";
+    }());
+  </script>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">NH</div>
+      <div>
+        <strong>NSE Heatmap</strong>
+        <span>Sector stream monitor</span>
+      </div>
+    </div>
+    <nav>
+      <button class="nav active" data-view="dashboard">Dashboard</button>
+      <button class="nav" data-view="heatmap">Sector Heatmap</button>
+      <button class="nav" data-view="indices">All Sectors</button>
+      <button class="nav" data-view="sector-stocks">Sector Stocks</button>
+      <button class="nav" data-view="settings">Settings</button>
+    </nav>
+  </aside>
+
+  <main>
+    <header class="topbar">
+      <div>
+        <h1 id="page-title">Dashboard</h1>
+        <p id="status-line">Loading NSE stream...</p>
+      </div>
+      <div class="actions">
+        <button id="theme-toggle" class="ghost" type="button" aria-pressed="false">Dark Mode</button>
+        <button id="refresh-btn" class="ghost" type="button">Refresh Now</button>
+        <button id="stop-btn" class="danger" type="button">Stop</button>
+        <button id="start-btn" class="primary" type="button">Start Streaming</button>
+      </div>
+    </header>
+
+    <section id="dashboard" class="view active">
+      <div class="metric-grid">
+        <article class="metric"><span>Streaming</span><strong id="m-streaming">-</strong></article>
+        <article class="metric"><span>Last NSE Tick</span><strong id="m-snapshot">-</strong></article>
+        <article class="metric"><span>Last Success</span><strong id="m-success">-</strong></article>
+        <article class="metric"><span>Refreshes</span><strong id="m-count">-</strong></article>
+        <article class="metric"><span>Sectors</span><strong id="m-sectors">-</strong></article>
+        <article class="metric"><span>Poll Speed</span><strong id="m-speed">-</strong></article>
+      </div>
+
+      <div class="leader-grid">
+        <article class="leader gain">
+          <span>Max Gained Sector</span>
+          <strong id="max-gain-name">-</strong>
+          <div class="leader-value good" id="max-gain-change">-</div>
+          <p id="max-gain-detail">Waiting for NSE data.</p>
+        </article>
+        <article class="leader loss">
+          <span>Max Loss Sector</span>
+          <strong id="max-loss-name">-</strong>
+          <div class="leader-value bad" id="max-loss-change">-</div>
+          <p id="max-loss-detail">Waiting for NSE data.</p>
+        </article>
+      </div>
+
+      <div class="panel dashboard-panel">
+        <div class="panel-head">
+          <h2>Sector Momentum</h2>
+        </div>
+        <div id="momentum-list" class="momentum-list"></div>
+      </div>
+    </section>
+
+    <section id="heatmap" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Live Sector Heatmap</h2>
+          <span id="heatmap-note">Streaming on</span>
+        </div>
+        <div id="sector-heatmap" class="sector-heatmap"></div>
+      </div>
+    </section>
+
+    <section id="indices" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Sectoral Indices</h2>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Sector</th><th>LTP</th><th>Change</th><th>% Change</th><th>Open</th><th>High</th><th>Low</th><th>Adv</th><th>Dec</th><th>Breadth</th>
+            </tr>
+          </thead>
+          <tbody id="indices-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="sector-stocks" class="view">
+      <div class="stock-summary">
+        <article class="metric"><span>Selected Sectors</span><strong id="stock-sector-count">-</strong></article>
+        <article class="metric"><span>Stocks Shown</span><strong id="stock-count">-</strong></article>
+        <article class="metric"><span>Selection Rule</span><strong>Top 2 / Bottom 2</strong></article>
+      </div>
+      <div id="stock-groups" class="stock-groups"></div>
+    </section>
+
+    <section id="settings" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Feed Settings</h2>
+        </div>
+        <div class="settings-list">
+          <div><span>Source Page</span><a id="source-url" href="#" target="_blank" rel="noreferrer">-</a></div>
+          <div><span>API Endpoint</span><strong id="api-url">-</strong></div>
+          <div><span>Stock Endpoint</span><strong id="stock-api-url">-</strong></div>
+          <div><span>Poll Interval</span><strong id="poll-interval">-</strong></div>
+          <div><span>Last Error</span><strong id="last-error">-</strong></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
