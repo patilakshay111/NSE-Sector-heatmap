@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import datetime as dt
 from http import cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -25,7 +26,12 @@ NSE_LIVE_EQUITY_URL = f"{NSE_HOME}/market-data/live-equity-market?symbol=NIFTY%2
 NSE_ALL_INDICES_API = f"{NSE_HOME}/api/allIndices"
 NSE_STOCK_INDICES_API = f"{NSE_HOME}/api/NextApi/apiClient/marketWatchApi?functionName=getIndicesData"
 NSE_QUOTE_EQUITY_API = f"{NSE_HOME}/api/quote-equity"
+NSE_MARKET_STATUS_API = f"{NSE_HOME}/api/marketStatus"
+NSE_HOLIDAY_API = f"{NSE_HOME}/api/holiday-master?type=trading"
 POLL_SECONDS = 30
+IDLE_POLL_SECONDS = 300
+MARKET_OPEN_TIME = dt.time(9, 0)
+MARKET_CLOSE_TIME = dt.time(15, 31)
 SECTOR_PICK_COUNT = 2
 STOCKS_PER_SECTOR = 5
 PAPER_INITIAL_CAPITAL = 1_000_000.0
@@ -34,6 +40,10 @@ M5_SECONDS = 300
 VWAP_RETEST_TOLERANCE = 0.003
 PAPER_START_HOUR = 9
 PAPER_START_MINUTE = 20
+MIN_TRADE_RR = 1.5
+PAPER_MOVE_SL_TO_BE = True
+PAPER_BE_TRIGGER_RR = 1.0
+PAPER_BE_LOCK_RR = 0.10
 
 SECTOR_KEYWORDS = {
     "AUTO",
@@ -72,6 +82,34 @@ SECTOR_KEYWORDS = {
 
 def _now_label() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _today_key() -> str:
+    return time.strftime("%Y-%m-%d")
+
+
+def _date_key(value: dt.date) -> str:
+    return value.isoformat()
+
+
+def _trade_date_key(trade: dict[str, Any], *fields: str) -> str:
+    for field in fields:
+        value = str(trade.get(field) or "")
+        if len(value) >= 10 and value[4] == "-" and value[7] == "-":
+            return value[:10]
+    return ""
+
+
+def _parse_nse_date(value: Any) -> dt.date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 def _to_float(value: Any) -> float | None:
@@ -177,7 +215,24 @@ def _stock_row(
         "low": _first_float(high_low.get("min"), item.get("dayLow"), item.get("low")),
         "volume": _first_float(item.get("totalTradedVolume"), item.get("volume")),
         "lastUpdateTime": item.get("lastUpdateTime") or item.get("lastUpdate") or "",
+        "dataSource": "NSE quote-equity" if quote_payload else "NSE sector constituent feed",
+        "priceIsMock": False,
     }
+
+
+def _stock_row_from_quote(symbol: str, quote_payload: dict[str, Any]) -> dict[str, Any]:
+    info = quote_payload.get("info") if isinstance(quote_payload.get("info"), dict) else {}
+    price_info = _quote_price_info(quote_payload)
+    return _stock_row(
+        {
+            "symbol": info.get("symbol") or symbol,
+            "companyName": info.get("companyName") or info.get("companyName2") or "",
+            "lastUpdateTime": quote_payload.get("lastUpdateTime") or price_info.get("lastUpdateTime") or "",
+        },
+        "ACTIVE PAPER TRADE",
+        "mark",
+        quote_payload,
+    )
 
 
 def _round_price(value: float | None) -> float | None:
@@ -217,29 +272,51 @@ class PaperTradingEngine:
         self.persistence_error: str | None = None
         self._load()
 
-    def update(self, stock_groups: list[dict[str, Any]]) -> dict[str, Any]:
+    def update(
+        self,
+        stock_groups: list[dict[str, Any]],
+        market_open: bool = True,
+        mark_stocks: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         stocks = self._selected_stocks(stock_groups)
+        mark_stocks = self._merge_mark_stocks(stocks, mark_stocks or [])
         now = time.time()
         session_open = self._session_is_open(now)
-        if not session_open:
+        if not market_open or not session_open:
             self.last_ideas = []
             self._persist()
             return self.snapshot()
         for stock in stocks:
             self._update_candle(stock, now)
-        self._mark_active_trades(stocks)
+        self._mark_active_trades(mark_stocks)
         ideas = self._build_ideas(stocks)
         self._activate_ready_ideas(ideas)
-        self._mark_active_trades(stocks)
+        self._mark_active_trades(mark_stocks)
         self.last_ideas = ideas
         self._persist()
         return self.snapshot()
+
+    def active_symbols(self) -> set[str]:
+        return {str(trade.get("symbol") or "").strip() for trade in self.active_trades.values() if trade.get("symbol")}
+
+    def active_mark_targets(self) -> dict[str, str]:
+        return {
+            str(trade.get("symbol") or "").strip(): str(trade.get("sector") or "").strip()
+            for trade in self.active_trades.values()
+            if trade.get("symbol")
+        }
 
     def snapshot(self) -> dict[str, Any]:
         active = list(self.active_trades.values())
         active_allocated = sum(trade["allocation"] for trade in active)
         unrealized_pnl = sum(trade.get("unrealizedPnl") or 0 for trade in active)
         equity = self.initial_capital + self.realized_pnl + unrealized_pnl
+        closed_count = len(self.closed_trades)
+        winning_trades = [trade for trade in self.closed_trades if (_to_float(trade.get("realizedPnl")) or 0) > 0]
+        losing_trades = [trade for trade in self.closed_trades if (_to_float(trade.get("realizedPnl")) or 0) < 0]
+        gross_profit = sum(_to_float(trade.get("realizedPnl")) or 0 for trade in winning_trades)
+        gross_loss = abs(sum(_to_float(trade.get("realizedPnl")) or 0 for trade in losing_trades))
+        profit_factor = gross_profit / gross_loss if gross_loss else None
         return {
             "initialCapital": self.initial_capital,
             "allocationPerTrade": self.trade_allocation,
@@ -249,7 +326,26 @@ class PaperTradingEngine:
             "unrealizedPnl": unrealized_pnl,
             "equity": equity,
             "activeCount": len(active),
-            "closedCount": len(self.closed_trades),
+            "closedCount": closed_count,
+            "totalTrades": len(active) + closed_count,
+            "winningTrades": len(winning_trades),
+            "losingTrades": len(losing_trades),
+            "winRate": (len(winning_trades) / closed_count) * 100 if closed_count else None,
+            "profitFactor": profit_factor,
+            "profitFactorLabel": f"{profit_factor:.2f}" if profit_factor is not None else "No losses" if gross_profit > 0 else "-",
+            "dailyReport": self._daily_report(active),
+            "dataPolicy": {
+                "allowMockPrices": False,
+                "priceSource": "NSE live endpoints only",
+                "paperEntryPrice": "current NSE last traded price at signal time",
+                "m5Confirmation": "last completed 5-minute bucket only",
+                "lookAheadBiasGuard": "paper signals never use a still-forming M5 candle",
+            },
+            "stopManagement": {
+                "moveSlToBreakEven": PAPER_MOVE_SL_TO_BE,
+                "breakEvenTriggerRr": PAPER_BE_TRIGGER_RR,
+                "profitLockRr": PAPER_BE_LOCK_RR,
+            },
             "ideaCount": len(self.last_ideas),
             "sessionOpen": self._session_is_open(),
             "sessionStart": f"{PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d}",
@@ -262,6 +358,110 @@ class PaperTradingEngine:
             "activeTrades": active,
             "closedTrades": self.closed_trades[-12:],
         }
+
+    def _daily_report(self, active: list[dict[str, Any]]) -> dict[str, Any]:
+        day_key = _today_key()
+        closed_today = [
+            trade for trade in self.closed_trades
+            if _trade_date_key(trade, "exitTime", "closedAt") == day_key
+        ]
+        active_today = [
+            trade for trade in active
+            if _trade_date_key(trade, "entryTime", "openedAt") == day_key
+        ]
+        closed_stats = self._closed_stats(closed_today)
+        open_pnl = sum(_to_float(trade.get("unrealizedPnl")) or 0 for trade in active_today)
+        realized_pnl = closed_stats["pnl"]
+        return {
+            "date": day_key,
+            "realizedPnl": _round_price(realized_pnl),
+            "unrealizedPnl": _round_price(open_pnl),
+            "totalPnl": _round_price(realized_pnl + open_pnl),
+            "closedTrades": len(closed_today),
+            "openTrades": len(active_today),
+            "totalTrades": len(closed_today) + len(active_today),
+            "winningTrades": closed_stats["wins"],
+            "losingTrades": closed_stats["losses"],
+            "winRate": closed_stats["winRate"],
+            "profitFactor": closed_stats["profitFactor"],
+            "profitFactorLabel": closed_stats["profitFactorLabel"],
+            "stockRows": self._group_report_rows(closed_today, active_today, "symbol"),
+            "thesisRows": self._group_report_rows(closed_today, active_today, "thesis"),
+            "exitRows": self._exit_report_rows(closed_today),
+        }
+
+    @staticmethod
+    def _closed_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
+        pnls = [_to_float(trade.get("realizedPnl")) or 0 for trade in trades]
+        wins = len([pnl for pnl in pnls if pnl > 0])
+        losses = len([pnl for pnl in pnls if pnl < 0])
+        gross_profit = sum(pnl for pnl in pnls if pnl > 0)
+        gross_loss = abs(sum(pnl for pnl in pnls if pnl < 0))
+        profit_factor = gross_profit / gross_loss if gross_loss else None
+        return {
+            "pnl": sum(pnls),
+            "wins": wins,
+            "losses": losses,
+            "winRate": (wins / len(trades)) * 100 if trades else None,
+            "profitFactor": profit_factor,
+            "profitFactorLabel": f"{profit_factor:.2f}" if profit_factor is not None else "No losses" if gross_profit > 0 else "-",
+        }
+
+    def _group_report_rows(
+        self,
+        closed_trades: list[dict[str, Any]],
+        active_trades: list[dict[str, Any]],
+        group_key: str,
+    ) -> list[dict[str, Any]]:
+        groups: dict[str, dict[str, Any]] = {}
+        for trade in closed_trades:
+            label = str(trade.get(group_key) or "-")
+            row = groups.setdefault(label, {"name": label, "closed": [], "open": []})
+            row["closed"].append(trade)
+        for trade in active_trades:
+            label = str(trade.get(group_key) or "-")
+            row = groups.setdefault(label, {"name": label, "closed": [], "open": []})
+            row["open"].append(trade)
+
+        rows = []
+        for label, group in groups.items():
+            stats = self._closed_stats(group["closed"])
+            open_pnl = sum(_to_float(trade.get("unrealizedPnl")) or 0 for trade in group["open"])
+            rows.append({
+                "name": label,
+                "realizedPnl": _round_price(stats["pnl"]),
+                "unrealizedPnl": _round_price(open_pnl),
+                "totalPnl": _round_price(stats["pnl"] + open_pnl),
+                "closedTrades": len(group["closed"]),
+                "openTrades": len(group["open"]),
+                "totalTrades": len(group["closed"]) + len(group["open"]),
+                "winningTrades": stats["wins"],
+                "losingTrades": stats["losses"],
+                "winRate": stats["winRate"],
+                "profitFactorLabel": stats["profitFactorLabel"],
+            })
+        rows.sort(key=lambda row: row["totalPnl"] or 0, reverse=True)
+        return rows
+
+    def _exit_report_rows(self, closed_trades: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for trade in closed_trades:
+            reason = str(trade.get("exitReason") or "UNKNOWN")
+            grouped.setdefault(reason, []).append(trade)
+        rows = []
+        for reason, trades in grouped.items():
+            stats = self._closed_stats(trades)
+            rows.append({
+                "name": reason,
+                "realizedPnl": _round_price(stats["pnl"]),
+                "closedTrades": len(trades),
+                "winningTrades": stats["wins"],
+                "losingTrades": stats["losses"],
+                "winRate": stats["winRate"],
+                "profitFactorLabel": stats["profitFactorLabel"],
+            })
+        rows.sort(key=lambda row: row["realizedPnl"] or 0, reverse=True)
+        return rows
 
     def _load(self) -> None:
         if not PAPER_STATE_PATH.exists():
@@ -323,6 +523,8 @@ class PaperTradingEngine:
             trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
             trade["openedAt"] = trade["entryTime"]
             trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+            trade["initialStopLoss"] = trade.get("initialStopLoss") or trade.get("stopLoss")
+            trade["stopMovedToBe"] = bool(trade.get("stopMovedToBe"))
         for trade in self.closed_trades:
             trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
             trade["openedAt"] = trade["entryTime"]
@@ -351,6 +553,20 @@ class PaperTradingEngine:
                 if merged.get("symbol") and _to_float(merged.get("current")) is not None:
                     stocks.append(merged)
         return stocks
+
+    @staticmethod
+    def _merge_mark_stocks(
+        selected_stocks: list[dict[str, Any]],
+        active_quote_stocks: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        by_symbol: dict[str, dict[str, Any]] = {}
+        for stock in selected_stocks:
+            by_symbol[str(stock.get("symbol") or "")] = stock
+        for stock in active_quote_stocks:
+            symbol = str(stock.get("symbol") or "")
+            if symbol and _to_float(stock.get("current")) is not None:
+                by_symbol[symbol] = stock
+        return list(by_symbol.values())
 
     def _update_candle(self, stock: dict[str, Any], now: float) -> None:
         symbol = stock["symbol"]
@@ -381,7 +597,7 @@ class PaperTradingEngine:
 
     def _latest_candle(self, symbol: str) -> dict[str, Any] | None:
         candles = self.candles.get(symbol) or []
-        return candles[-1] if candles else None
+        return candles[-2] if len(candles) >= 2 else None
 
     def _build_ideas(self, stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         ideas = []
@@ -489,8 +705,12 @@ class PaperTradingEngine:
             "profitIfTp": _round_price(profit_if_tp),
             "allocation": self.trade_allocation,
             "quantity": quantity,
-            "ready": bool(ready and rr is not None and quantity > 0 and active_key not in self.active_trades),
-            "status": "Already active" if active_key in self.active_trades else status,
+            "ready": bool(ready and rr is not None and rr > MIN_TRADE_RR and quantity > 0 and active_key not in self.active_trades),
+            "status": "Already active"
+            if active_key in self.active_trades
+            else f"Rejected: RR must be above {MIN_TRADE_RR}"
+            if ready and (rr is None or rr <= MIN_TRADE_RR)
+            else status,
             "m5": {
                 "open": _round_price(candle["open"]),
                 "high": _round_price(candle["high"]),
@@ -560,6 +780,7 @@ class PaperTradingEngine:
             "thesis": idea["thesis"],
             "entry": idea["entry"],
             "stopLoss": idea["stopLoss"],
+            "initialStopLoss": idea["stopLoss"],
             "target": idea["target"],
             "quantity": idea["quantity"],
             "allocation": self.trade_allocation,
@@ -568,6 +789,8 @@ class PaperTradingEngine:
             "lossIfSl": idea["lossIfSl"],
             "profitIfTp": idea["profitIfTp"],
             "unrealizedPnl": 0.0,
+            "stopMovedToBe": False,
+            "stopMoveReason": "",
             "entryTime": entry_time,
             "openedAt": entry_time,
             "status": "ACTIVE",
@@ -588,8 +811,9 @@ class PaperTradingEngine:
                 continue
             trade["currentPrice"] = _round_price(price)
             trade["unrealizedPnl"] = _round_price(_trade_pnl(trade["side"], trade["entry"], price, trade["quantity"]))
-            rr = _risk_reward(trade["side"], price, trade["stopLoss"], trade["target"])
-            trade["currentRr"] = round(rr, 2) if rr is not None else None
+            current_rr = self._current_trade_rr(trade, price)
+            trade["currentRr"] = round(current_rr, 2) if current_rr is not None else None
+            self._move_stop_to_break_even(trade, price)
             exit_reason = None
             exit_price = None
             if trade["side"] == "BUY":
@@ -605,7 +829,58 @@ class PaperTradingEngine:
             if exit_reason:
                 self._close_trade(key, trade, exit_reason, exit_price)
 
-    def _close_trade(self, key: str, trade: dict[str, Any], exit_reason: str, exit_price: float) -> None:
+    def _move_stop_to_break_even(self, trade: dict[str, Any], price: float) -> None:
+        if not PAPER_MOVE_SL_TO_BE or trade.get("stopMovedToBe"):
+            return
+        current_rr = self._current_trade_rr(trade, price)
+        if current_rr is None or current_rr < PAPER_BE_TRIGGER_RR:
+            return
+        entry = _to_float(trade.get("entry"))
+        initial_stop = _to_float(trade.get("initialStopLoss") or trade.get("stopLoss"))
+        current_stop = _to_float(trade.get("stopLoss"))
+        if entry is None or initial_stop is None or current_stop is None:
+            return
+        initial_risk = abs(entry - initial_stop)
+        if initial_risk <= 0:
+            return
+        if trade["side"] == "BUY":
+            new_stop = entry + (initial_risk * PAPER_BE_LOCK_RR)
+            if new_stop <= current_stop or new_stop >= price:
+                return
+        else:
+            new_stop = entry - (initial_risk * PAPER_BE_LOCK_RR)
+            if new_stop >= current_stop or new_stop <= price:
+                return
+        trade["stopLoss"] = _round_price(new_stop)
+        trade["stopMovedToBe"] = True
+        trade["stopMoveReason"] = f"Moved to BE+{PAPER_BE_LOCK_RR}R after {PAPER_BE_TRIGGER_RR}R"
+
+    @staticmethod
+    def _current_trade_rr(trade: dict[str, Any], price: float) -> float | None:
+        entry = _to_float(trade.get("entry"))
+        initial_stop = _to_float(trade.get("initialStopLoss") or trade.get("stopLoss"))
+        if entry is None or initial_stop is None:
+            return None
+        risk = abs(entry - initial_stop)
+        if risk <= 0:
+            return None
+        move = price - entry if trade.get("side") == "BUY" else entry - price
+        return move / risk
+
+    def close_trade_by_id(self, trade_id: str) -> dict[str, Any]:
+        requested = str(trade_id or "").strip().upper()
+        for key, trade in list(self.active_trades.items()):
+            if str(trade.get("id") or "").upper() != requested:
+                continue
+            exit_price = _to_float(trade.get("currentPrice")) or _to_float(trade.get("entry"))
+            if exit_price is None:
+                return {"ok": False, "error": f"No current price available for {requested}."}
+            closed = self._close_trade(key, trade, "MANUAL", exit_price)
+            self._persist()
+            return {"ok": True, "trade": closed}
+        return {"ok": False, "error": f"Active trade {requested or '-'} was not found."}
+
+    def _close_trade(self, key: str, trade: dict[str, Any], exit_reason: str, exit_price: float) -> dict[str, Any]:
         pnl = _trade_pnl(trade["side"], trade["entry"], exit_price, trade["quantity"])
         self.realized_pnl += pnl
         exit_time = _now_label()
@@ -621,6 +896,7 @@ class PaperTradingEngine:
         }
         self.closed_trades.append(closed)
         self.active_trades.pop(key, None)
+        return closed
 
 
 class NSEClient:
@@ -643,7 +919,17 @@ class NSEClient:
 
     def fetch_quote_equity(self, symbol: str) -> dict[str, Any]:
         encoded = parse.quote(symbol, safe="")
-        return self._fetch_with_cookie_retry(f"{NSE_QUOTE_EQUITY_API}?symbol={encoded}")
+        return self._fetch_with_cookie_retry(
+            f"{NSE_QUOTE_EQUITY_API}?symbol={encoded}",
+            referer=NSE_LIVE_EQUITY_URL,
+            warm_url=NSE_LIVE_EQUITY_URL,
+        )
+
+    def fetch_market_status(self) -> dict[str, Any]:
+        return self._fetch_with_cookie_retry(NSE_MARKET_STATUS_API)
+
+    def fetch_trading_holidays(self) -> dict[str, Any]:
+        return self._fetch_with_cookie_retry(NSE_HOLIDAY_API)
 
     def _fetch_with_cookie_retry(
         self,
@@ -697,6 +983,8 @@ class FeedState:
     source_url: str = NSE_HEATMAP_URL
     api_url: str = NSE_ALL_INDICES_API
     stock_api_url: str = NSE_STOCK_INDICES_API
+    market_status_api_url: str = NSE_MARKET_STATUS_API
+    holiday_api_url: str = NSE_HOLIDAY_API
     poll_seconds: int = POLL_SECONDS
     fetch_count: int = 0
     sector_rows: list[dict[str, Any]] = field(default_factory=list)
@@ -705,6 +993,8 @@ class FeedState:
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
     market_status: dict[str, Any] = field(default_factory=dict)
+    market_clock: dict[str, Any] = field(default_factory=dict)
+    data_provenance: dict[str, Any] = field(default_factory=dict)
     snapshot_time: str | None = None
     raw_count: int = 0
 
@@ -715,6 +1005,13 @@ class NSEStreamer:
         self.paper_engine = PaperTradingEngine()
         self.state = FeedState()
         self.lock = threading.RLock()
+        self.paper_lock = threading.RLock()
+        self.holiday_cache: dict[int, dict[str, str]] = {}
+        self.holiday_loaded_at = 0.0
+        self.holiday_error: str | None = None
+        self.market_status_cache: dict[str, Any] = {}
+        self.market_status_loaded_at = 0.0
+        self.market_status_error: str | None = None
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -738,30 +1035,56 @@ class NSEStreamer:
             return was_running
 
     def refresh_once(self) -> dict[str, Any]:
-        self._fetch_and_store()
+        self._fetch_and_store(force=True)
         return self.status()
 
     def status(self) -> dict[str, Any]:
         with self.lock:
+            clock = self.state.market_clock or {}
             data = {
                 **self.state.__dict__,
-                "streaming_label": "On" if self.state.running else "Off",
+                "streaming_label": "On" if self.state.running and clock.get("shouldStream", True) else "Scheduled" if self.state.running else "Off",
             }
         return data
 
+    def close_paper_trade(self, trade_id: str) -> dict[str, Any]:
+        with self.paper_lock:
+            result = self.paper_engine.close_trade_by_id(trade_id)
+            paper_trading = self.paper_engine.snapshot()
+        with self.lock:
+            self.state.paper_trading = paper_trading
+            status = self.status()
+        return {**result, "status": status}
+
     def _run(self) -> None:
         while not self.stop_event.is_set():
-            self._fetch_and_store()
-            self.stop_event.wait(POLL_SECONDS)
+            clock = self._market_clock()
+            self._set_market_clock(clock)
+            if clock["shouldStream"]:
+                self._fetch_and_store(market_clock=clock)
+                wait_seconds = POLL_SECONDS
+            else:
+                wait_seconds = max(POLL_SECONDS, min(IDLE_POLL_SECONDS, int(clock.get("secondsToNextOpen") or IDLE_POLL_SECONDS)))
+            self.stop_event.wait(wait_seconds)
 
-    def _fetch_and_store(self) -> None:
+    def _fetch_and_store(self, market_clock: dict[str, Any] | None = None, force: bool = False) -> None:
+        market_clock = market_clock or self._market_clock(force=force)
         with self.lock:
             self.state.last_fetch_started_at = _now_label()
+            self.state.market_clock = market_clock
         try:
             payload = self.client.fetch_all_indices()
             parsed = self._parse_payload(payload)
             stock_groups = self._fetch_sector_stock_groups(parsed["sector_rows"])
-            paper_trading = self.paper_engine.update(stock_groups)
+            with self.paper_lock:
+                active_targets = self.paper_engine.active_mark_targets()
+            active_quote_stocks = self._fetch_active_trade_marks(active_targets, stock_groups)
+            with self.paper_lock:
+                paper_trading = self.paper_engine.update(
+                    stock_groups,
+                    market_open=bool(market_clock.get("shouldStream")),
+                    mark_stocks=active_quote_stocks,
+                )
             with self.lock:
                 self.state.last_error = None
                 self.state.last_success_at = _now_label()
@@ -771,12 +1094,138 @@ class NSEStreamer:
                 self.state.paper_trading = paper_trading
                 self.state.max_gainer = parsed["max_gainer"]
                 self.state.max_loser = parsed["max_loser"]
-                self.state.market_status = parsed["market_status"]
+                self.state.market_status = self.market_status_cache or parsed["market_status"]
+                self.state.market_clock = market_clock
+                self.state.data_provenance = self._data_provenance()
                 self.state.snapshot_time = parsed["snapshot_time"]
                 self.state.raw_count = parsed["raw_count"]
         except Exception as exc:  # noqa: BLE001 - surface the feed problem to the UI
             with self.lock:
                 self.state.last_error = str(exc)
+                self.state.market_clock = market_clock
+
+    def _set_market_clock(self, clock: dict[str, Any]) -> None:
+        with self.paper_lock:
+            paper_trading = self.paper_engine.snapshot()
+        with self.lock:
+            self.state.market_clock = clock
+            self.state.market_status = self.market_status_cache
+            self.state.data_provenance = self._data_provenance()
+            self.state.paper_trading = paper_trading
+
+    def _market_clock(self, force: bool = False) -> dict[str, Any]:
+        today = dt.datetime.now().date()
+        now = dt.datetime.now()
+        self._refresh_market_reference(today)
+        holidays = self.holiday_cache.get(today.year, {})
+        holiday_name = holidays.get(_date_key(today), "")
+        is_weekend = today.weekday() >= 5
+        is_holiday = bool(holiday_name)
+        in_hours = MARKET_OPEN_TIME <= now.time() <= MARKET_CLOSE_TIME
+        should_stream = not is_weekend and not is_holiday and in_hours
+        if is_weekend:
+            reason = "Weekend"
+        elif is_holiday:
+            reason = f"Trading holiday: {holiday_name}"
+        elif now.time() < MARKET_OPEN_TIME:
+            reason = "Before market open"
+        elif now.time() > MARKET_CLOSE_TIME:
+            reason = "After market close"
+        else:
+            reason = "Market hours"
+        if force and not should_stream:
+            reason = f"Manual refresh; {reason}"
+        next_open = self._next_trading_start(now)
+        return {
+            "checkedAt": _now_label(),
+            "today": _date_key(today),
+            "shouldStream": should_stream,
+            "manualRefresh": force,
+            "reason": reason,
+            "isWeekend": is_weekend,
+            "isHoliday": is_holiday,
+            "holidayName": holiday_name,
+            "marketOpenTime": MARKET_OPEN_TIME.strftime("%H:%M"),
+            "marketCloseTime": MARKET_CLOSE_TIME.strftime("%H:%M"),
+            "nextOpenAt": next_open.strftime("%Y-%m-%d %H:%M:%S"),
+            "secondsToNextOpen": max(0, int((next_open - now).total_seconds())),
+            "holidaySourceOk": not self.holiday_error,
+            "holidayError": self.holiday_error,
+            "marketStatusSourceOk": not self.market_status_error,
+            "marketStatusError": self.market_status_error,
+            "nextHoliday": self._next_holiday(today),
+        }
+
+    def _refresh_market_reference(self, today: dt.date) -> None:
+        now = time.time()
+        if today.year not in self.holiday_cache or now - self.holiday_loaded_at > 12 * 60 * 60:
+            try:
+                self.holiday_cache[today.year] = self._parse_holidays(self.client.fetch_trading_holidays())
+                self.holiday_loaded_at = now
+                self.holiday_error = None
+            except Exception as exc:  # noqa: BLE001 - fallback to weekend/clock gate and surface the issue
+                self.holiday_error = str(exc)
+                self.holiday_loaded_at = now
+                self.holiday_cache.setdefault(today.year, {})
+        if now - self.market_status_loaded_at > 5 * 60:
+            try:
+                self.market_status_cache = self.client.fetch_market_status()
+                self.market_status_loaded_at = now
+                self.market_status_error = None
+            except Exception as exc:  # noqa: BLE001 - status is informational; clock/holiday still gate streaming
+                self.market_status_error = str(exc)
+                self.market_status_loaded_at = now
+
+    @staticmethod
+    def _parse_holidays(payload: dict[str, Any]) -> dict[str, str]:
+        holidays: dict[str, str] = {}
+        containers = payload.values() if isinstance(payload, dict) else []
+        for container in containers:
+            if not isinstance(container, list):
+                continue
+            for item in container:
+                if not isinstance(item, dict):
+                    continue
+                holiday_date = _parse_nse_date(item.get("tradingDate") or item.get("date") or item.get("holidayDate"))
+                if not holiday_date:
+                    continue
+                description = str(item.get("description") or item.get("name") or item.get("occasion") or "Trading holiday")
+                holidays[_date_key(holiday_date)] = description
+        return holidays
+
+    def _next_trading_start(self, now: dt.datetime) -> dt.datetime:
+        candidate = dt.datetime.combine(now.date(), MARKET_OPEN_TIME)
+        if now.time() >= MARKET_OPEN_TIME:
+            candidate += dt.timedelta(days=1)
+        while True:
+            date_key = _date_key(candidate.date())
+            holidays = self.holiday_cache.get(candidate.year, {})
+            if candidate.weekday() < 5 and date_key not in holidays:
+                return candidate
+            candidate += dt.timedelta(days=1)
+
+    def _next_holiday(self, today: dt.date) -> dict[str, str] | None:
+        rows = []
+        for year_rows in self.holiday_cache.values():
+            for date_key, description in year_rows.items():
+                holiday_date = _parse_nse_date(date_key)
+                if holiday_date and holiday_date >= today:
+                    rows.append((holiday_date, description))
+        if not rows:
+            return None
+        holiday_date, description = min(rows, key=lambda item: item[0])
+        return {"date": _date_key(holiday_date), "description": description}
+
+    def _data_provenance(self) -> dict[str, Any]:
+        return {
+            "mockPricesAllowed": False,
+            "indexFeed": NSE_ALL_INDICES_API,
+            "stockFeed": NSE_STOCK_INDICES_API,
+            "quoteFeed": NSE_QUOTE_EQUITY_API,
+            "holidayFeed": NSE_HOLIDAY_API,
+            "marketStatusFeed": NSE_MARKET_STATUS_API,
+            "paperLogic": "live NSE prices only; no mock price fallback; completed M5 candles only",
+        }
 
     def _fetch_sector_stock_groups(self, sector_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         gain_sectors = sector_rows[:SECTOR_PICK_COUNT]
@@ -794,6 +1243,57 @@ class NSEStreamer:
         for sector, direction in selections:
             groups.append(self._fetch_sector_stock_group(sector, direction))
         return groups
+
+    def _fetch_active_trade_marks(
+        self,
+        active_targets: dict[str, str],
+        stock_groups: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not active_targets:
+            return []
+        selected_symbols = {
+            str(stock.get("symbol") or "")
+            for group in stock_groups
+            for stock in (group.get("stocks") or [])
+        }
+        quote_stocks = []
+        missing_targets = {
+            symbol: sector for symbol, sector in active_targets.items()
+            if symbol and symbol not in selected_symbols
+        }
+        by_sector: dict[str, list[str]] = {}
+        for symbol, sector in missing_targets.items():
+            by_sector.setdefault(sector, []).append(symbol)
+
+        found_symbols: set[str] = set()
+        for sector, symbols in by_sector.items():
+            if sector.upper().startswith("NIFTY "):
+                try:
+                    payload = self.client.fetch_sector_stocks(sector)
+                    stocks = self._parse_sector_stocks(payload, sector, "mark")
+                    by_symbol = {str(stock.get("symbol") or ""): stock for stock in stocks}
+                    for symbol in symbols:
+                        stock = by_symbol.get(symbol)
+                        if stock:
+                            quote_stocks.append(stock)
+                            found_symbols.add(symbol)
+                except Exception:
+                    pass
+
+        for symbol in sorted(set(missing_targets) - found_symbols):
+            try:
+                quote_stocks.append(_stock_row_from_quote(symbol, self.client.fetch_quote_equity(symbol)))
+            except Exception as exc:  # noqa: BLE001 - do not fail the full stream for one stale active mark
+                quote_stocks.append({
+                    "symbol": symbol,
+                    "sector": active_targets.get(symbol) or "ACTIVE PAPER TRADE",
+                    "direction": "mark",
+                    "current": None,
+                    "quoteError": str(exc),
+                    "dataSource": "NSE sector constituent feed / quote-equity",
+                    "priceIsMock": False,
+                })
+        return quote_stocks
 
     def _fetch_sector_stock_group(self, sector: dict[str, Any], direction: str) -> dict[str, Any]:
         sector_symbol = sector["symbol"]
@@ -904,6 +1404,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "stopped": stopped, "status": streamer.status()})
         elif self.path == "/api/refresh":
             self._json({"ok": True, "status": streamer.refresh_once()})
+        elif self.path == "/api/paper-trades/close":
+            payload = self._read_json()
+            result = streamer.close_paper_trade(str(payload.get("trade_id") or payload.get("id") or ""))
+            self._json(result, 200 if result.get("ok") else 400)
         else:
             self._not_found()
 
@@ -933,6 +1437,15 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _not_found(self) -> None:
         self._json({"error": "not found"}, 404)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except json.JSONDecodeError:
+            return {}
 
 
 def main() -> None:

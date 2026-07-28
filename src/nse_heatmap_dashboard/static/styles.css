@@ -214,9 +214,14 @@ button.danger {
 
 .paper-summary {
   display: grid;
-  grid-template-columns: repeat(7, minmax(130px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
   gap: 12px;
   margin-bottom: 14px;
+}
+
+.close-trade-btn {
+  min-height: 30px;
+  padding: 6px 10px;
 }
 
 .metric,
@@ -398,6 +403,20 @@ button.danger {
   margin-bottom: 14px;
 }
 
+.report-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.report-panel {
+  min-width: 0;
+}
+
+.report-wide {
+  grid-column: 1 / -1;
+}
+
 .ready-row {
   background: color-mix(in srgb, var(--heat-good), var(--panel) 92%);
 }
@@ -505,6 +524,7 @@ th {
   .leader-grid,
   .stock-summary,
   .paper-summary,
+  .report-grid,
   .sector-heatmap {
     grid-template-columns: 1fr;
   }

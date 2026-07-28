@@ -233,6 +233,9 @@ function renderPaperTrading(paper) {
   q("#p-realized").textContent = fmt(data.realizedPnl);
   q("#p-realized").className = changeClass(data.realizedPnl);
   q("#p-active-count").textContent = data.activeCount ?? "-";
+  q("#p-total-trades").textContent = data.totalTrades ?? "-";
+  q("#p-win-rate").textContent = Number.isFinite(Number(data.winRate)) ? pct(data.winRate) : "-";
+  q("#p-profit-factor").textContent = data.profitFactorLabel || (Number.isFinite(Number(data.profitFactor)) ? fmt(data.profitFactor, 2) : "-");
   q("#p-saved").textContent = data.persistenceError ? "Save error" : data.lastSavedAt || "-";
   q("#p-saved").className = data.persistenceError ? "bad" : "";
   q("#p-idea-count").textContent = data.sessionOpen ? `${ideas.length} ideas` : data.sessionStatus || "Waiting for session";
@@ -277,8 +280,13 @@ function renderPaperTrading(paper) {
       <td>${fmt(trade.target)}</td>
       <td>${fmt(trade.currentRr ?? trade.rr)}</td>
       <td class="${changeClass(trade.unrealizedPnl)}">${fmt(trade.unrealizedPnl)}</td>
+      <td>
+        <strong>${trade.stopMovedToBe ? "BE+" : "Initial"}</strong>
+        <span>${safe(trade.stopMoveReason || "Waiting for RR trigger")}</span>
+      </td>
+      <td><button class="close-trade-btn danger" type="button" data-trade-id="${safe(trade.id)}">Close</button></td>
     </tr>
-  `).join("") : "<tr><td colspan=\"12\" class=\"empty-state\">No active paper trades yet.</td></tr>";
+  `).join("") : "<tr><td colspan=\"14\" class=\"empty-state\">No active paper trades yet.</td></tr>";
 
   q("#closed-trades-body").innerHTML = closedTrades.length ? closedTrades.map((trade) => `
     <tr>
@@ -296,13 +304,78 @@ function renderPaperTrading(paper) {
   `).join("") : "<tr><td colspan=\"10\" class=\"empty-state\">No closed paper trades yet.</td></tr>";
 }
 
+function reportPnlRows(rows, emptyText, colspan = 8) {
+  if (!rows.length) {
+    return `<tr><td colspan="${colspan}" class="empty-state">${emptyText}</td></tr>`;
+  }
+  return rows.map((row) => `
+    <tr>
+      <td>${safe(row.name)}</td>
+      <td class="${changeClass(row.totalPnl)}">${fmt(row.totalPnl)}</td>
+      <td class="${changeClass(row.realizedPnl)}">${fmt(row.realizedPnl)}</td>
+      <td class="${changeClass(row.unrealizedPnl)}">${fmt(row.unrealizedPnl)}</td>
+      <td>${fmt(row.totalTrades, 0)} <span>${fmt(row.closedTrades, 0)} closed / ${fmt(row.openTrades, 0)} open</span></td>
+      <td>${Number.isFinite(Number(row.winRate)) ? pct(row.winRate) : "-"}</td>
+      <td>${safe(row.profitFactorLabel || "-")}</td>
+      <td>${fmt(row.winningTrades, 0)} / ${fmt(row.losingTrades, 0)}</td>
+    </tr>
+  `).join("");
+}
+
+function renderPaperReport(paper) {
+  const report = paper?.dailyReport || {};
+  q("#r-date").textContent = report.date || "-";
+  q("#r-total-pnl").textContent = fmt(report.totalPnl);
+  q("#r-total-pnl").className = changeClass(report.totalPnl);
+  q("#r-realized-pnl").textContent = fmt(report.realizedPnl);
+  q("#r-realized-pnl").className = changeClass(report.realizedPnl);
+  q("#r-open-pnl").textContent = fmt(report.unrealizedPnl);
+  q("#r-open-pnl").className = changeClass(report.unrealizedPnl);
+  q("#r-total-trades").textContent = report.totalTrades ?? "-";
+  q("#r-win-rate").textContent = Number.isFinite(Number(report.winRate)) ? pct(report.winRate) : "-";
+  q("#r-profit-factor").textContent = report.profitFactorLabel || "-";
+
+  q("#stock-pnl-body").innerHTML = reportPnlRows(report.stockRows || [], "No stock P/L for today yet.");
+  q("#thesis-pnl-body").innerHTML = reportPnlRows(report.thesisRows || [], "No thesis P/L for today yet.");
+  const exitRows = report.exitRows || [];
+  q("#exit-pnl-body").innerHTML = exitRows.length ? exitRows.map((row) => `
+    <tr>
+      <td>${safe(row.name)}</td>
+      <td class="${changeClass(row.realizedPnl)}">${fmt(row.realizedPnl)}</td>
+      <td>${fmt(row.closedTrades, 0)}</td>
+      <td>${Number.isFinite(Number(row.winRate)) ? pct(row.winRate) : "-"}</td>
+      <td>${safe(row.profitFactorLabel || "-")}</td>
+      <td>${fmt(row.winningTrades, 0)} / ${fmt(row.losingTrades, 0)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"6\" class=\"empty-state\">No exits for today yet.</td></tr>";
+}
+
 function renderSettings(status) {
   const source = q("#source-url");
   source.textContent = status.source_url || "-";
   source.href = status.source_url || "#";
   q("#api-url").textContent = status.api_url || "-";
   q("#stock-api-url").textContent = status.stock_api_url || "-";
+  q("#holiday-api-url").textContent = status.holiday_api_url || "-";
+  q("#market-status-api-url").textContent = status.market_status_api_url || "-";
   q("#poll-interval").textContent = `${status.poll_seconds || 0}s`;
+  const clock = status.market_clock || {};
+  const nextHoliday = clock.nextHoliday || null;
+  q("#market-clock").textContent = `${clock.shouldStream ? "Open" : "Sleeping"} / ${clock.reason || "-"}`;
+  q("#market-clock").className = clock.shouldStream ? "good" : "warn";
+  q("#next-open-at").textContent = clock.nextOpenAt || "-";
+  q("#today-holiday").textContent = clock.isHoliday ? clock.holidayName || "Trading holiday" : "No";
+  q("#today-holiday").className = clock.isHoliday ? "warn" : "good";
+  q("#next-holiday").textContent = nextHoliday ? `${nextHoliday.date} / ${nextHoliday.description}` : "-";
+  const provenance = status.data_provenance || {};
+  q("#mock-prices").textContent = provenance.mockPricesAllowed ? "Allowed" : "Blocked";
+  q("#mock-prices").className = provenance.mockPricesAllowed ? "bad" : "good";
+  q("#paper-data-policy").textContent = status.paper_trading?.dataPolicy?.lookAheadBiasGuard || provenance.paperLogic || "-";
+  const stopConfig = status.paper_trading?.stopManagement || {};
+  q("#paper-be-enabled").textContent = stopConfig.moveSlToBreakEven ? "On" : "Off";
+  q("#paper-be-enabled").className = stopConfig.moveSlToBreakEven ? "good" : "warn";
+  q("#paper-be-trigger").textContent = `${fmt(stopConfig.breakEvenTriggerRr, 2)}R`;
+  q("#paper-be-lock").textContent = `${fmt(stopConfig.profitLockRr, 2)}R`;
   q("#last-error").textContent = status.last_error || "-";
   q("#last-error").className = status.last_error ? "bad" : "";
 }
@@ -311,9 +384,10 @@ function renderStatus(status) {
   state.status = status;
   const rows = status.sector_rows || [];
   const ok = status.running && !status.last_error;
+  const clock = status.market_clock || {};
   q("#status-line").textContent = status.last_error
     ? `NSE stream warning: ${status.last_error}`
-    : `${status.streaming_label} / ${status.snapshot_time || "waiting for NSE tick"}`;
+    : `${status.streaming_label} / ${clock.reason || "Market clock"} / ${status.snapshot_time || clock.nextOpenAt || "waiting for NSE tick"}`;
   q("#status-line").className = status.last_error ? "bad" : "";
   q("#m-streaming").textContent = status.streaming_label || "-";
   q("#m-streaming").className = ok ? "good" : status.running ? "warn" : "bad";
@@ -330,6 +404,7 @@ function renderStatus(status) {
   renderTable(rows);
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
+  renderPaperReport(status.paper_trading || {});
   renderSettings(status);
 }
 
@@ -340,6 +415,15 @@ async function refresh() {
 
 async function command(path) {
   const result = await api(path, { method: "POST" });
+  renderStatus(result.status);
+}
+
+async function closePaperTrade(tradeId) {
+  const result = await api("/api/paper-trades/close", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trade_id: tradeId }),
+  });
   renderStatus(result.status);
 }
 
@@ -360,6 +444,19 @@ q("#stop-btn").addEventListener("click", () => command("/api/stop").catch((err) 
 q("#refresh-btn").addEventListener("click", () => command("/api/refresh").catch((err) => {
   q("#status-line").textContent = err.message;
 }));
+
+document.addEventListener("click", (event) => {
+  const button = event.target?.closest?.(".close-trade-btn");
+  if (!button) return;
+  const tradeId = button.dataset.tradeId;
+  button.disabled = true;
+  button.textContent = "Closing...";
+  closePaperTrade(tradeId).catch((err) => {
+    q("#status-line").textContent = err.message;
+    button.disabled = false;
+    button.textContent = "Close";
+  });
+});
 
 refresh().catch((err) => {
   q("#status-line").textContent = err.message;

@@ -28,6 +28,7 @@
       <button class="nav" data-view="indices">All Sectors</button>
       <button class="nav" data-view="sector-stocks">Sector Stocks</button>
       <button class="nav" data-view="paper-trades">Paper Trades</button>
+      <button class="nav" data-view="paper-pnl">Paper PnL</button>
       <button class="nav" data-view="settings">Settings</button>
     </nav>
   </aside>
@@ -122,6 +123,9 @@
         <article class="metric"><span>Unrealized P/L</span><strong id="p-unrealized">-</strong></article>
         <article class="metric"><span>Realized P/L</span><strong id="p-realized">-</strong></article>
         <article class="metric"><span>Active Trades</span><strong id="p-active-count">-</strong></article>
+        <article class="metric"><span>Total Trades</span><strong id="p-total-trades">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="p-win-rate">-</strong></article>
+        <article class="metric"><span>PF</span><strong id="p-profit-factor">-</strong></article>
         <article class="metric"><span>Last Saved</span><strong id="p-saved">-</strong></article>
       </div>
 
@@ -151,7 +155,7 @@
           <table>
             <thead>
               <tr>
-                <th>Trade</th><th>Stock</th><th>Side</th><th>Thesis</th><th>Qty</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current RR</th><th>P/L</th>
+                <th>Trade</th><th>Stock</th><th>Side</th><th>Thesis</th><th>Qty</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Current RR</th><th>P/L</th><th>Stop</th><th>Action</th>
               </tr>
             </thead>
             <tbody id="active-trades-body"></tbody>
@@ -177,6 +181,62 @@
       </div>
     </section>
 
+    <section id="paper-pnl" class="view">
+      <div class="paper-summary">
+        <article class="metric"><span>Report Date</span><strong id="r-date">-</strong></article>
+        <article class="metric"><span>Today P/L</span><strong id="r-total-pnl">-</strong></article>
+        <article class="metric"><span>Realized P/L</span><strong id="r-realized-pnl">-</strong></article>
+        <article class="metric"><span>Open P/L</span><strong id="r-open-pnl">-</strong></article>
+        <article class="metric"><span>Total Trades</span><strong id="r-total-trades">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="r-win-rate">-</strong></article>
+        <article class="metric"><span>PF</span><strong id="r-profit-factor">-</strong></article>
+      </div>
+
+      <div class="report-grid">
+        <div class="panel report-panel">
+          <div class="panel-head">
+            <h2>Stock Wise PnL</h2>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr><th>Stock</th><th>Total P/L</th><th>Realized</th><th>Open</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>W/L</th></tr>
+              </thead>
+              <tbody id="stock-pnl-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel report-panel">
+          <div class="panel-head">
+            <h2>PnL Per Thesis</h2>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr><th>Thesis</th><th>Total P/L</th><th>Realized</th><th>Open</th><th>Trades</th><th>Win Rate</th><th>PF</th><th>W/L</th></tr>
+              </thead>
+              <tbody id="thesis-pnl-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel report-panel report-wide">
+          <div class="panel-head">
+            <h2>Exit Breakdown</h2>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr><th>Exit</th><th>Realized P/L</th><th>Closed Trades</th><th>Win Rate</th><th>PF</th><th>W/L</th></tr>
+              </thead>
+              <tbody id="exit-pnl-body"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="settings" class="view">
       <div class="panel">
         <div class="panel-head">
@@ -186,7 +246,18 @@
           <div><span>Source Page</span><a id="source-url" href="#" target="_blank" rel="noreferrer">-</a></div>
           <div><span>API Endpoint</span><strong id="api-url">-</strong></div>
           <div><span>Stock Endpoint</span><strong id="stock-api-url">-</strong></div>
+          <div><span>Holiday Endpoint</span><strong id="holiday-api-url">-</strong></div>
+          <div><span>Market Status Endpoint</span><strong id="market-status-api-url">-</strong></div>
           <div><span>Poll Interval</span><strong id="poll-interval">-</strong></div>
+          <div><span>Market Clock</span><strong id="market-clock">-</strong></div>
+          <div><span>Next Stream Start</span><strong id="next-open-at">-</strong></div>
+          <div><span>Today Holiday</span><strong id="today-holiday">-</strong></div>
+          <div><span>Next Holiday</span><strong id="next-holiday">-</strong></div>
+          <div><span>Mock Prices</span><strong id="mock-prices">-</strong></div>
+          <div><span>Paper Data Policy</span><strong id="paper-data-policy">-</strong></div>
+          <div><span>Move SL To BE</span><strong id="paper-be-enabled">-</strong></div>
+          <div><span>BE Trigger RR</span><strong id="paper-be-trigger">-</strong></div>
+          <div><span>Profit Lock RR</span><strong id="paper-be-lock">-</strong></div>
           <div><span>Last Error</span><strong id="last-error">-</strong></div>
         </div>
       </div>
