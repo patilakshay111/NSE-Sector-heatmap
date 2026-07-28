@@ -162,19 +162,34 @@ function renderTable(rows) {
 
 function renderStockGroups(groups) {
   const target = q("#stock-groups");
+  const validGroups = groups.filter((group) => !group.noSetup);
   const stockCount = groups.reduce((count, group) => count + (group.stocks || []).length, 0);
-  q("#stock-sector-count").textContent = groups.length || "-";
-  q("#stock-count").textContent = stockCount || "-";
+  q("#stock-sector-count").textContent = groups.length ? String(validGroups.length) : "-";
+  q("#stock-count").textContent = groups.length ? String(stockCount) : "-";
 
   if (!groups.length) {
-    target.innerHTML = "<div class=\"empty-state\">Start streaming to select top and losing sectors.</div>";
+    target.innerHTML = "<div class=\"empty-state\">Start streaming to select valid buy and sell sectors.</div>";
     return;
   }
 
   target.innerHTML = groups.map((group) => {
     const stocks = group.stocks || [];
     const tone = group.direction === "gain" ? "gain" : "loss";
-    const groupTitle = group.direction === "gain" ? "Top gain sector" : "Top losing sector";
+    const groupTitle = group.direction === "gain" ? "Buy setup sector" : "Sell setup sector";
+    if (group.noSetup) {
+      return `
+        <article class="stock-group ${tone} no-setup">
+          <div class="panel-head">
+            <div>
+              <h2>No valid setup</h2>
+              <span>${groupTitle}</span>
+            </div>
+            <strong>-</strong>
+          </div>
+          <div class="empty-state">${safe(group.reason || "No valid setup for this side.")}</div>
+        </article>
+      `;
+    }
     const rows = stocks.length ? stocks.map((stock) => `
       <tr>
         <td>

@@ -34,6 +34,8 @@ MARKET_OPEN_TIME = dt.time(9, 0)
 MARKET_CLOSE_TIME = dt.time(15, 31)
 SECTOR_PICK_COUNT = 2
 STOCKS_PER_SECTOR = 5
+BUY_SECTOR_THRESHOLD = 0.25
+SELL_SECTOR_THRESHOLD = -0.25
 PAPER_INITIAL_CAPITAL = 1_000_000.0
 PAPER_TRADE_ALLOCATION = 50_000.0
 M5_SECONDS = 300
@@ -573,6 +575,8 @@ class PaperTradingEngine:
     def _selected_stocks(stock_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
         stocks = []
         for group in stock_groups:
+            if group.get("noSetup"):
+                continue
             for stock in group.get("stocks") or []:
                 merged = {**stock, "sector": group.get("sector") or stock.get("sector"), "direction": group.get("direction") or stock.get("direction")}
                 if merged.get("symbol") and _to_float(merged.get("current")) is not None:
@@ -1257,8 +1261,14 @@ class NSEStreamer:
         }
 
     def _fetch_sector_stock_groups(self, sector_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        gain_sectors = sector_rows[:SECTOR_PICK_COUNT]
-        loss_sectors = sorted(sector_rows, key=lambda row: row["percentChange"])[:SECTOR_PICK_COUNT]
+        gain_sectors = [
+            row for row in sector_rows
+            if row["percentChange"] is not None and row["percentChange"] >= BUY_SECTOR_THRESHOLD
+        ][:SECTOR_PICK_COUNT]
+        loss_sectors = [
+            row for row in sorted(sector_rows, key=lambda row: row["percentChange"])
+            if row["percentChange"] is not None and row["percentChange"] <= SELL_SECTOR_THRESHOLD
+        ][:SECTOR_PICK_COUNT]
         selections: list[tuple[dict[str, Any], str]] = []
         seen: set[tuple[str, str]] = set()
         for direction, selected_sectors in (("gain", gain_sectors), ("loss", loss_sectors)):
@@ -1271,7 +1281,23 @@ class NSEStreamer:
         groups = []
         for sector, direction in selections:
             groups.append(self._fetch_sector_stock_group(sector, direction))
+        if not gain_sectors:
+            groups.append(self._no_setup_group("gain", f"No valid setup: no sector is up at least {BUY_SECTOR_THRESHOLD:.2f}%"))
+        if not loss_sectors:
+            groups.append(self._no_setup_group("loss", f"No valid setup: no sector is down at least {abs(SELL_SECTOR_THRESHOLD):.2f}%"))
         return groups
+
+    @staticmethod
+    def _no_setup_group(direction: str, reason: str) -> dict[str, Any]:
+        return {
+            "sector": "No valid setup",
+            "sectorPercentChange": None,
+            "direction": direction,
+            "stocks": [],
+            "error": None,
+            "noSetup": True,
+            "reason": reason,
+        }
 
     def _fetch_active_trade_marks(
         self,

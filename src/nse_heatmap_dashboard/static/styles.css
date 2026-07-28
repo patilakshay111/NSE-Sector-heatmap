@@ -395,6 +395,11 @@ button.danger {
   border-left-color: var(--heat-bad);
 }
 
+.stock-group.no-setup {
+  border-left-color: var(--muted);
+  opacity: 0.82;
+}
+
 .table-scroll {
   overflow-x: auto;
 }
