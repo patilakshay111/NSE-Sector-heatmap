@@ -100,6 +100,16 @@ def _trade_date_key(trade: dict[str, Any], *fields: str) -> str:
     return ""
 
 
+def _valid_date_key(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        return None
+
+
 def _parse_nse_date(value: Any) -> dt.date | None:
     text = str(value or "").strip()
     if not text:
@@ -333,7 +343,7 @@ class PaperTradingEngine:
             "winRate": (len(winning_trades) / closed_count) * 100 if closed_count else None,
             "profitFactor": profit_factor,
             "profitFactorLabel": f"{profit_factor:.2f}" if profit_factor is not None else "No losses" if gross_profit > 0 else "-",
-            "dailyReport": self._daily_report(active),
+            "dailyReport": self.daily_report(active=active),
             "dataPolicy": {
                 "allowMockPrices": False,
                 "priceSource": "NSE live endpoints only",
@@ -359,14 +369,15 @@ class PaperTradingEngine:
             "closedTrades": self.closed_trades[-12:],
         }
 
-    def _daily_report(self, active: list[dict[str, Any]]) -> dict[str, Any]:
-        day_key = _today_key()
+    def daily_report(self, date_key: str | None = None, active: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        day_key = _valid_date_key(date_key) or _today_key()
+        active_trades = list(self.active_trades.values()) if active is None else active
         closed_today = [
             trade for trade in self.closed_trades
             if _trade_date_key(trade, "exitTime", "closedAt") == day_key
         ]
         active_today = [
-            trade for trade in active
+            trade for trade in active_trades
             if _trade_date_key(trade, "entryTime", "openedAt") == day_key
         ]
         closed_stats = self._closed_stats(closed_today)
@@ -374,6 +385,7 @@ class PaperTradingEngine:
         realized_pnl = closed_stats["pnl"]
         return {
             "date": day_key,
+            "today": _today_key(),
             "realizedPnl": _round_price(realized_pnl),
             "unrealizedPnl": _round_price(open_pnl),
             "totalPnl": _round_price(realized_pnl + open_pnl),
@@ -385,10 +397,23 @@ class PaperTradingEngine:
             "winRate": closed_stats["winRate"],
             "profitFactor": closed_stats["profitFactor"],
             "profitFactorLabel": closed_stats["profitFactorLabel"],
+            "availableDates": self._available_report_dates(active_trades),
             "stockRows": self._group_report_rows(closed_today, active_today, "symbol"),
             "thesisRows": self._group_report_rows(closed_today, active_today, "thesis"),
             "exitRows": self._exit_report_rows(closed_today),
         }
+
+    def _available_report_dates(self, active: list[dict[str, Any]]) -> list[str]:
+        dates = {_today_key()}
+        for trade in self.closed_trades:
+            day = _trade_date_key(trade, "exitTime", "closedAt", "entryTime", "openedAt")
+            if day:
+                dates.add(day)
+        for trade in active:
+            day = _trade_date_key(trade, "entryTime", "openedAt")
+            if day:
+                dates.add(day)
+        return sorted(dates)
 
     @staticmethod
     def _closed_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1056,6 +1081,10 @@ class NSEStreamer:
             status = self.status()
         return {**result, "status": status}
 
+    def paper_report(self, date_key: str | None = None) -> dict[str, Any]:
+        with self.paper_lock:
+            return self.paper_engine.daily_report(date_key)
+
     def _run(self) -> None:
         while not self.stop_event.is_set():
             clock = self._market_clock()
@@ -1384,14 +1413,20 @@ class AppHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):  # noqa: N802
-        if self.path == "/" or self.path.startswith("/?"):
+        url = parse.urlparse(self.path)
+        path = url.path
+        if path == "/":
             self._serve_static("index.html", "text/html; charset=utf-8")
-        elif self.path.startswith("/static/"):
-            name = self.path.replace("/static/", "", 1).split("?", 1)[0]
+        elif path.startswith("/static/"):
+            name = path.replace("/static/", "", 1)
             content_type = "text/css; charset=utf-8" if name.endswith(".css") else "application/javascript; charset=utf-8"
             self._serve_static(name, content_type)
-        elif self.path == "/api/status":
+        elif path == "/api/status":
             self._json(streamer.status())
+        elif path == "/api/paper-pnl":
+            params = parse.parse_qs(url.query)
+            date_key = params.get("date", [""])[0]
+            self._json({"ok": True, "dailyReport": streamer.paper_report(date_key)})
         else:
             self._not_found()
 

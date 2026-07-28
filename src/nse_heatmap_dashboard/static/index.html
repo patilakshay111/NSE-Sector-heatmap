@@ -182,9 +182,17 @@
     </section>
 
     <section id="paper-pnl" class="view">
+      <div class="panel report-toolbar">
+        <label for="paper-pnl-date">
+          <span>Report Day</span>
+          <input id="paper-pnl-date" type="date" />
+        </label>
+        <button id="paper-pnl-today" type="button">Today</button>
+      </div>
+
       <div class="paper-summary">
         <article class="metric"><span>Report Date</span><strong id="r-date">-</strong></article>
-        <article class="metric"><span>Today P/L</span><strong id="r-total-pnl">-</strong></article>
+        <article class="metric"><span>Day P/L</span><strong id="r-total-pnl">-</strong></article>
         <article class="metric"><span>Realized P/L</span><strong id="r-realized-pnl">-</strong></article>
         <article class="metric"><span>Open P/L</span><strong id="r-open-pnl">-</strong></article>
         <article class="metric"><span>Total Trades</span><strong id="r-total-trades">-</strong></article>

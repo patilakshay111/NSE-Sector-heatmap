@@ -1,6 +1,7 @@
 const state = {
   view: "dashboard",
   status: null,
+  pnlDate: null,
   theme: document.documentElement.dataset.theme === "dark" ? "dark" : "light",
 };
 
@@ -322,8 +323,23 @@ function reportPnlRows(rows, emptyText, colspan = 8) {
   `).join("");
 }
 
-function renderPaperReport(paper) {
-  const report = paper?.dailyReport || {};
+function syncPnlDateControl(report) {
+  const input = q("#paper-pnl-date");
+  if (!input || !report?.date) return;
+  if (report.today) {
+    input.max = report.today;
+  } else {
+    input.removeAttribute("max");
+  }
+  input.value = report.date;
+  state.pnlDate = report.date;
+}
+
+function renderPaperReport(report, options = {}) {
+  report = report || {};
+  if (options.syncDate !== false) {
+    syncPnlDateControl(report);
+  }
   q("#r-date").textContent = report.date || "-";
   q("#r-total-pnl").textContent = fmt(report.totalPnl);
   q("#r-total-pnl").className = changeClass(report.totalPnl);
@@ -335,8 +351,9 @@ function renderPaperReport(paper) {
   q("#r-win-rate").textContent = Number.isFinite(Number(report.winRate)) ? pct(report.winRate) : "-";
   q("#r-profit-factor").textContent = report.profitFactorLabel || "-";
 
-  q("#stock-pnl-body").innerHTML = reportPnlRows(report.stockRows || [], "No stock P/L for today yet.");
-  q("#thesis-pnl-body").innerHTML = reportPnlRows(report.thesisRows || [], "No thesis P/L for today yet.");
+  const emptySuffix = report.date ? `for ${report.date}` : "for this day";
+  q("#stock-pnl-body").innerHTML = reportPnlRows(report.stockRows || [], `No stock P/L ${emptySuffix}.`);
+  q("#thesis-pnl-body").innerHTML = reportPnlRows(report.thesisRows || [], `No thesis P/L ${emptySuffix}.`);
   const exitRows = report.exitRows || [];
   q("#exit-pnl-body").innerHTML = exitRows.length ? exitRows.map((row) => `
     <tr>
@@ -347,7 +364,13 @@ function renderPaperReport(paper) {
       <td>${safe(row.profitFactorLabel || "-")}</td>
       <td>${fmt(row.winningTrades, 0)} / ${fmt(row.losingTrades, 0)}</td>
     </tr>
-  `).join("") : "<tr><td colspan=\"6\" class=\"empty-state\">No exits for today yet.</td></tr>";
+  `).join("") : `<tr><td colspan="6" class="empty-state">No exits ${emptySuffix}.</td></tr>`;
+}
+
+async function loadPaperReport(dateKey) {
+  const query = dateKey ? `?date=${encodeURIComponent(dateKey)}` : "";
+  const result = await api(`/api/paper-pnl${query}`);
+  renderPaperReport(result.dailyReport || {}, { syncDate: true });
 }
 
 function renderSettings(status) {
@@ -404,7 +427,10 @@ function renderStatus(status) {
   renderTable(rows);
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
-  renderPaperReport(status.paper_trading || {});
+  const liveReport = status.paper_trading?.dailyReport || {};
+  if (!state.pnlDate || state.pnlDate === liveReport.date) {
+    renderPaperReport(liveReport);
+  }
   renderSettings(status);
 }
 
@@ -444,6 +470,24 @@ q("#stop-btn").addEventListener("click", () => command("/api/stop").catch((err) 
 q("#refresh-btn").addEventListener("click", () => command("/api/refresh").catch((err) => {
   q("#status-line").textContent = err.message;
 }));
+q("#paper-pnl-date").addEventListener("change", (event) => {
+  const selectedDate = event.target.value;
+  state.pnlDate = selectedDate;
+  loadPaperReport(selectedDate).catch((err) => {
+    q("#status-line").textContent = err.message;
+  });
+});
+q("#paper-pnl-today").addEventListener("click", () => {
+  const today = state.status?.paper_trading?.dailyReport?.date || "";
+  state.pnlDate = today || null;
+  if (today) {
+    renderPaperReport(state.status.paper_trading.dailyReport);
+  } else {
+    loadPaperReport("").catch((err) => {
+      q("#status-line").textContent = err.message;
+    });
+  }
+});
 
 document.addEventListener("click", (event) => {
   const button = event.target?.closest?.(".close-trade-btn");
