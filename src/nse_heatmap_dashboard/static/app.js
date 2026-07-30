@@ -2,6 +2,8 @@ const state = {
   view: "dashboard",
   status: null,
   pnlDate: null,
+  paperTradesMode: "today",
+  paperTradesDate: null,
   theme: document.documentElement.dataset.theme === "dark" ? "dark" : "light",
 };
 
@@ -245,6 +247,77 @@ function tradeSideClass(side) {
   return side === "BUY" ? "good" : "bad";
 }
 
+function tradeTimestamp(value) {
+  const text = String(value || "");
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return 0;
+  return Number(`${match[1]}${match[2]}${match[3]}${match[4]}${match[5]}`);
+}
+
+function tradeDateKey(value) {
+  const text = String(value || "");
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return "";
+  return `${match[1]}-${match[2]}-${match[3]}`;
+}
+
+function formatEntryTime(value) {
+  const text = String(value || "");
+  const match = text.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/);
+  if (!match) return "-";
+  return `${match[3]}:${match[2]}:${match[1]} ${match[4]}:${match[5]}`;
+}
+
+function formatExitTime(value) {
+  const text = String(value || "");
+  const match = text.match(/(?:^|\s)(\d{2}):(\d{2})/);
+  if (!match) return "-";
+  return `${match[1]}:${match[2]}`;
+}
+
+function exitReason(trade) {
+  return String(trade?.exitReason || trade?.status || "ACTIVE").toUpperCase();
+}
+
+function paperTradeStats(trades) {
+  const closed = trades.filter((trade) => exitReason(trade) !== "ACTIVE");
+  const active = trades.length - closed.length;
+  const winners = closed.filter((trade) => Number(trade.realizedPnl || 0) > 0).length;
+  const totalPnl = trades.reduce((sum, trade) => sum + Number(trade.realizedPnl ?? trade.unrealizedPnl ?? 0), 0);
+  let equity = 0;
+  let peak = 0;
+  let maxDrawdown = 0;
+  [...closed]
+    .sort((left, right) => (
+      tradeTimestamp(left.exitTime || left.closedAt || left.entryTime || left.openedAt)
+      - tradeTimestamp(right.exitTime || right.closedAt || right.entryTime || right.openedAt)
+    ))
+    .forEach((trade) => {
+      equity += Number(trade.realizedPnl || 0);
+      peak = Math.max(peak, equity);
+      maxDrawdown = Math.max(maxDrawdown, peak - equity);
+    });
+  return {
+    total: trades.length,
+    active,
+    closed: closed.length,
+    winRate: closed.length ? (winners / closed.length) * 100 : null,
+    totalPnl,
+    maxDrawdown,
+  };
+}
+
+function renderPaperTradeStats(stats) {
+  q("#pt-total").textContent = fmt(stats.total, 0);
+  q("#pt-active").textContent = fmt(stats.active, 0);
+  q("#pt-closed").textContent = fmt(stats.closed, 0);
+  q("#pt-win-rate").textContent = Number.isFinite(Number(stats.winRate)) ? pct(stats.winRate) : "-";
+  q("#pt-pnl").textContent = fmt(stats.totalPnl);
+  q("#pt-pnl").className = changeClass(stats.totalPnl);
+  q("#pt-max-dd").textContent = fmt(stats.maxDrawdown);
+  q("#pt-max-dd").className = stats.maxDrawdown > 0 ? "bad" : "";
+}
+
 function renderPaperTrading(paper) {
   const data = paper || {};
   const ideas = data.ideas || [];
@@ -328,6 +401,55 @@ function renderPaperTrading(paper) {
       <td class="${changeClass(trade.realizedPnl)}">${fmt(trade.realizedPnl)}</td>
     </tr>
   `).join("") : "<tr><td colspan=\"10\" class=\"empty-state\">No closed paper trades yet.</td></tr>";
+}
+
+function renderPaperTradesIndex(paper) {
+  const data = paper || {};
+  const allTrades = [...(data.allTrades || [])].sort((left, right) => (
+    tradeTimestamp(right.entryTime || right.openedAt) - tradeTimestamp(left.entryTime || left.openedAt)
+  ));
+  const today = data.dailyReport?.today || data.dailyReport?.date || new Date().toISOString().slice(0, 10);
+  const selectedDate = state.paperTradesMode === "all" ? "" : state.paperTradesDate || today;
+  const trades = selectedDate
+    ? allTrades.filter((trade) => tradeDateKey(trade.entryTime || trade.openedAt) === selectedDate)
+    : allTrades;
+  syncPaperTradesControls(today, selectedDate);
+  const countSuffix = selectedDate ? ` for ${selectedDate}` : "";
+  renderPaperTradeStats(paperTradeStats(trades));
+  q("#paper-trades-count").textContent = trades.length ? `${trades.length} trades${countSuffix}` : `No trades${countSuffix}`;
+  q("#all-paper-trades-body").innerHTML = trades.length ? trades.map((trade) => {
+    const pnl = trade.realizedPnl ?? trade.unrealizedPnl;
+    return `
+      <tr>
+        <td>
+          <strong>${safe(trade.id)}</strong>
+          <span>${safe(trade.status || "ACTIVE")}</span>
+        </td>
+        <td>${safe(trade.symbol)}</td>
+        <td class="${tradeSideClass(trade.side)}">${safe(trade.side)}</td>
+        <td>${safe(trade.thesis)}</td>
+        <td>${formatEntryTime(trade.entryTime || trade.openedAt)}</td>
+        <td>${fmt(trade.entry)}</td>
+        <td>${fmt(trade.stopLoss)}</td>
+        <td>${fmt(trade.target)}</td>
+        <td>${fmt(trade.quantity, 0)}</td>
+        <td>${formatExitTime(trade.exitTime || trade.closedAt)}</td>
+        <td>${safe(exitReason(trade))}</td>
+        <td class="${changeClass(pnl)}">${fmt(pnl)}</td>
+      </tr>
+    `;
+  }).join("") : "<tr><td colspan=\"12\" class=\"empty-state\">No paper trades yet.</td></tr>";
+}
+
+function syncPaperTradesControls(today, selectedDate) {
+  const todayButton = q("#paper-trades-today");
+  const allButton = q("#paper-trades-all");
+  const dateInput = q("#paper-trades-date");
+  if (!todayButton || !allButton || !dateInput) return;
+  todayButton.classList.toggle("active", state.paperTradesMode === "today");
+  allButton.classList.toggle("active", state.paperTradesMode === "all");
+  dateInput.value = selectedDate || "";
+  dateInput.max = today || "";
 }
 
 function reportPnlRows(rows, emptyText, colspan = 8) {
@@ -453,6 +575,7 @@ function renderStatus(status) {
   renderSectorSelectionRule(status.sector_selection_rule);
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
+  renderPaperTradesIndex(status.paper_trading || {});
   const liveReport = status.paper_trading?.dailyReport || {};
   if (!state.pnlDate || state.pnlDate === liveReport.date) {
     renderPaperReport(liveReport);
@@ -513,6 +636,21 @@ q("#paper-pnl-today").addEventListener("click", () => {
       q("#status-line").textContent = err.message;
     });
   }
+});
+q("#paper-trades-today").addEventListener("click", () => {
+  state.paperTradesMode = "today";
+  state.paperTradesDate = null;
+  renderPaperTradesIndex(state.status?.paper_trading || {});
+});
+q("#paper-trades-all").addEventListener("click", () => {
+  state.paperTradesMode = "all";
+  state.paperTradesDate = null;
+  renderPaperTradesIndex(state.status?.paper_trading || {});
+});
+q("#paper-trades-date").addEventListener("change", (event) => {
+  state.paperTradesMode = "date";
+  state.paperTradesDate = event.target.value || null;
+  renderPaperTradesIndex(state.status?.paper_trading || {});
 });
 
 document.addEventListener("click", (event) => {

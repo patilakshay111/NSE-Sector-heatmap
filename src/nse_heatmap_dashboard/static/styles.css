@@ -231,6 +231,11 @@ button.danger {
   padding: 6px 10px;
 }
 
+.report-toolbar button.active {
+  background: var(--primary);
+  color: #fff;
+}
+
 .metric,
 .panel,
 .leader,

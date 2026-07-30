@@ -353,7 +353,16 @@ class PaperTradingEngine:
             "openTrades": active,
             "activeTrades": active,
             "closedTrades": self.closed_trades[-12:],
+            "allTrades": self._all_trades_newest_first(active),
         }
+
+    def _all_trades_newest_first(self, active: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        trades = [*active, *self.closed_trades]
+        return sorted(
+            trades,
+            key=lambda trade: str(trade.get("entryTime") or trade.get("openedAt") or ""),
+            reverse=True,
+        )
 
     def daily_report(self, date_key: str | None = None, active: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         day_key = _valid_date_key(date_key) or _today_key()

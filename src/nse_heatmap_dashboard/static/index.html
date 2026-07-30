@@ -30,6 +30,7 @@
       <button class="nav" data-view="heatmap">Sector Heatmap</button>
       <button class="nav" data-view="indices">All Sectors</button>
       <button class="nav" data-view="sector-stocks">Sector Stocks</button>
+      <button class="nav" data-view="paper-dashboard">Paper Dashboard</button>
       <button class="nav" data-view="paper-trades">Paper Trades</button>
       <button class="nav" data-view="paper-pnl">Paper PnL</button>
       <button class="nav" data-view="settings">Settings</button>
@@ -119,7 +120,7 @@
       <div id="stock-groups" class="stock-groups"></div>
     </section>
 
-    <section id="paper-trades" class="view">
+    <section id="paper-dashboard" class="view">
       <div class="paper-summary">
         <article class="metric"><span>Initial Capital</span><strong id="p-initial">-</strong></article>
         <article class="metric"><span>Available</span><strong id="p-available">-</strong></article>
@@ -180,6 +181,43 @@
               </tr>
             </thead>
             <tbody id="closed-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="paper-trades" class="view">
+      <div class="panel report-toolbar">
+        <button id="paper-trades-today" type="button">Today</button>
+        <button id="paper-trades-all" type="button">All</button>
+        <label for="paper-trades-date">
+          <span>Trade Day</span>
+          <input id="paper-trades-date" type="date" />
+        </label>
+      </div>
+
+      <div class="paper-summary">
+        <article class="metric"><span>Total Trades</span><strong id="pt-total">-</strong></article>
+        <article class="metric"><span>Active</span><strong id="pt-active">-</strong></article>
+        <article class="metric"><span>Closed</span><strong id="pt-closed">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="pt-win-rate">-</strong></article>
+        <article class="metric"><span>Total P/L</span><strong id="pt-pnl">-</strong></article>
+        <article class="metric"><span>Max DD</span><strong id="pt-max-dd">-</strong></article>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Paper Trades</h2>
+          <span id="paper-trades-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Stock</th><th>Side</th><th>Thesis</th><th>Entry Time</th><th>Entry Price</th><th>SL</th><th>TP</th><th>Qty</th><th>Exit Time</th><th>Exit Reason</th><th>P/L</th>
+              </tr>
+            </thead>
+            <tbody id="all-paper-trades-body"></tbody>
           </table>
         </div>
       </div>
