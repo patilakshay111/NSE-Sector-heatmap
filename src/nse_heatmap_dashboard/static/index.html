@@ -3,7 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>NSE Heatmap Dashboard</title>
+  <meta name="author" content="Akshay Patil">
+  <title>NSE Heatmap Dashboard by Akshay Patil</title>
+  <link rel="icon" type="image/png" href="/static/assets/app-icon.png">
+  <link rel="apple-touch-icon" href="/static/assets/app-icon.png">
   <script>
     (function () {
       var theme = localStorage.getItem("theme");
@@ -16,7 +19,7 @@
 <body>
   <aside class="sidebar">
     <div class="brand">
-      <div class="brand-mark">NH</div>
+      <img class="brand-mark" src="/static/assets/app-icon.png" alt="NSE Heatmap app icon">
       <div>
         <strong>NSE Heatmap</strong>
         <span>Sector stream monitor</span>
@@ -31,6 +34,7 @@
       <button class="nav" data-view="paper-pnl">Paper PnL</button>
       <button class="nav" data-view="settings">Settings</button>
     </nav>
+    <div class="owner-mark">Property of Akshay Patil</div>
   </aside>
 
   <main>
@@ -110,7 +114,7 @@
       <div class="stock-summary">
         <article class="metric"><span>Selected Sectors</span><strong id="stock-sector-count">-</strong></article>
         <article class="metric"><span>Stocks Shown</span><strong id="stock-count">-</strong></article>
-        <article class="metric"><span>Selection Rule</span><strong>Buy >= +0.25% / Sell <= -0.25%</strong></article>
+        <article class="metric"><span>Selection Rule</span><strong id="stock-selection-rule">-</strong></article>
       </div>
       <div id="stock-groups" class="stock-groups"></div>
     </section>

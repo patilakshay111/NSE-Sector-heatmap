@@ -14,72 +14,42 @@ from typing import Any
 from urllib import error, parse, request
 import webbrowser
 
-
-ROOT = Path(__file__).resolve().parents[2]
-STATIC_ROOT = Path(__file__).resolve().parent / "static"
-DATA_ROOT = ROOT / "data"
-PAPER_STATE_PATH = DATA_ROOT / "paper_trading_state.json"
-
-NSE_HOME = "https://www.nseindia.com"
-NSE_HEATMAP_URL = f"{NSE_HOME}/market-data/live-market-indices/heatmap"
-NSE_LIVE_EQUITY_URL = f"{NSE_HOME}/market-data/live-equity-market?symbol=NIFTY%2050"
-NSE_ALL_INDICES_API = f"{NSE_HOME}/api/allIndices"
-NSE_STOCK_INDICES_API = f"{NSE_HOME}/api/NextApi/apiClient/marketWatchApi?functionName=getIndicesData"
-NSE_QUOTE_EQUITY_API = f"{NSE_HOME}/api/quote-equity"
-NSE_MARKET_STATUS_API = f"{NSE_HOME}/api/marketStatus"
-NSE_HOLIDAY_API = f"{NSE_HOME}/api/holiday-master?type=trading"
-POLL_SECONDS = 30
-IDLE_POLL_SECONDS = 300
-MARKET_OPEN_TIME = dt.time(9, 0)
-MARKET_CLOSE_TIME = dt.time(15, 31)
-SECTOR_PICK_COUNT = 2
-STOCKS_PER_SECTOR = 5
-BUY_SECTOR_THRESHOLD = 0.25
-SELL_SECTOR_THRESHOLD = -0.25
-PAPER_INITIAL_CAPITAL = 1_000_000.0
-PAPER_TRADE_ALLOCATION = 50_000.0
-M5_SECONDS = 300
-VWAP_RETEST_TOLERANCE = 0.003
-PAPER_START_HOUR = 9
-PAPER_START_MINUTE = 20
-MIN_TRADE_RR = 1.5
-PAPER_MOVE_SL_TO_BE = True
-PAPER_BE_TRIGGER_RR = 1.0
-PAPER_BE_LOCK_RR = 0.10
-
-SECTOR_KEYWORDS = {
-    "AUTO",
-    "BANK",
-    "CAPITAL GOODS",
-    "CEMENT",
-    "CHEMICALS",
-    "COMMERCIAL & TRANSPORT SERVICES",
-    "CONSTRUCTION",
-    "CONSUMER DURABLES",
-    "CONSUMER SERVICES",
-    "FINANCIAL SERVICES",
-    "FMCG",
-    "HEALTHCARE",
-    "HOSPITALS",
-    "HOUSING FINANCE",
-    "INSURANCE",
-    "IT",
-    "MEDIA",
-    "METAL",
-    "MIDSML IT & TELECOM",
-    "MIDSMALL FINANCIAL SERVICES",
-    "MIDSMALL HEALTHCARE",
-    "NBFC",
-    "OIL & GAS",
-    "PHARMA",
-    "POWER",
-    "PRIVATE BANK",
-    "PSU BANK",
-    "REALTY",
-    "REITS & REALTY",
-    "RETAIL",
-    "TELECOMMUNICATION",
-}
+from .config import (
+    BUY_SECTOR_THRESHOLD,
+    DAILY_STOCK_SL_LIMIT,
+    DATA_ROOT,
+    FRESH_CONFIRMATION_SECONDS,
+    IDLE_POLL_SECONDS,
+    M5_SECONDS,
+    MARKET_CLOSE_TIME,
+    MARKET_OPEN_TIME,
+    MIN_TRADE_RR,
+    NSE_ALL_INDICES_API,
+    NSE_HEATMAP_URL,
+    NSE_HOLIDAY_API,
+    NSE_HOME,
+    NSE_LIVE_EQUITY_URL,
+    NSE_MARKET_STATUS_API,
+    NSE_QUOTE_EQUITY_API,
+    NSE_STOCK_INDICES_API,
+    PAPER_BE_LOCK_RR,
+    PAPER_BE_TRIGGER_RR,
+    PAPER_INITIAL_CAPITAL,
+    PAPER_MOVE_SL_TO_BE,
+    PAPER_SQUARE_OFF_HOUR,
+    PAPER_SQUARE_OFF_MINUTE,
+    PAPER_START_HOUR,
+    PAPER_START_MINUTE,
+    PAPER_STATE_PATH,
+    PAPER_TRADE_ALLOCATION,
+    POLL_SECONDS,
+    SECTOR_KEYWORDS,
+    SECTOR_PICK_COUNT,
+    SELL_SECTOR_THRESHOLD,
+    STATIC_ROOT,
+    STOCKS_PER_SECTOR,
+    VWAP_RETEST_TOLERANCE,
+)
 
 
 def _now_label() -> str:
@@ -278,8 +248,10 @@ class PaperTradingEngine:
         self.active_trades: dict[str, dict[str, Any]] = {}
         self.closed_trades: list[dict[str, Any]] = []
         self.fib_watch: dict[str, dict[str, Any]] = {}
+        self.used_confirmations: dict[str, int] = {}
         self.next_trade_id = 1
         self.last_ideas: list[dict[str, Any]] = []
+        self.last_ideas_date: str | None = None
         self.last_saved_at: str | None = None
         self.persistence_error: str | None = None
         self._load()
@@ -293,18 +265,24 @@ class PaperTradingEngine:
         stocks = self._selected_stocks(stock_groups)
         mark_stocks = self._merge_mark_stocks(stocks, mark_stocks or [])
         now = time.time()
-        session_open = self._session_is_open(now)
-        if not market_open or not session_open:
-            self.last_ideas = []
+        entry_session_open = self._entry_session_is_open(now)
+        square_off_due = self._square_off_due(now)
+        if market_open:
+            self._mark_active_trades(mark_stocks)
+            if square_off_due:
+                self._square_off_open_trades()
+        if not market_open or not entry_session_open:
+            self._clear_last_ideas()
             self._persist()
             return self.snapshot()
         for stock in stocks:
             self._update_candle(stock, now)
         self._mark_active_trades(mark_stocks)
-        ideas = self._build_ideas(stocks)
+        ideas = self._build_ideas(stocks, now)
         self._activate_ready_ideas(ideas)
         self._mark_active_trades(mark_stocks)
         self.last_ideas = ideas
+        self.last_ideas_date = _today_key()
         self._persist()
         return self.snapshot()
 
@@ -351,7 +329,11 @@ class PaperTradingEngine:
                 "priceSource": "NSE live endpoints only",
                 "paperEntryPrice": "current NSE last traded price at signal time",
                 "m5Confirmation": "last completed 5-minute bucket only",
+                "freshConfirmationWindowSeconds": FRESH_CONFIRMATION_SECONDS,
                 "lookAheadBiasGuard": "paper signals never use a still-forming M5 candle",
+                "activeTradeMonitoring": "active trades are marked to live prices whenever the NSE stream is live",
+                "intradaySquareOff": f"open trades auto-close at {PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}",
+                "dailyStockSlLimit": DAILY_STOCK_SL_LIMIT,
             },
             "stopManagement": {
                 "moveSlToBreakEven": PAPER_MOVE_SL_TO_BE,
@@ -359,8 +341,10 @@ class PaperTradingEngine:
                 "profitLockRr": PAPER_BE_LOCK_RR,
             },
             "ideaCount": len(self.last_ideas),
-            "sessionOpen": self._session_is_open(),
+            "ideasDate": self.last_ideas_date,
+            "sessionOpen": self._entry_session_is_open(),
             "sessionStart": f"{PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d}",
+            "squareOffTime": f"{PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}",
             "sessionStatus": self._session_status(),
             "lastSavedAt": self.last_saved_at,
             "persistencePath": str(PAPER_STATE_PATH),
@@ -378,12 +362,12 @@ class PaperTradingEngine:
             trade for trade in self.closed_trades
             if _trade_date_key(trade, "exitTime", "closedAt") == day_key
         ]
-        active_today = [
+        active_for_day = active_trades if day_key == _today_key() else [
             trade for trade in active_trades
             if _trade_date_key(trade, "entryTime", "openedAt") == day_key
         ]
         closed_stats = self._closed_stats(closed_today)
-        open_pnl = sum(_to_float(trade.get("unrealizedPnl")) or 0 for trade in active_today)
+        open_pnl = sum(_to_float(trade.get("unrealizedPnl")) or 0 for trade in active_for_day)
         realized_pnl = closed_stats["pnl"]
         return {
             "date": day_key,
@@ -392,16 +376,18 @@ class PaperTradingEngine:
             "unrealizedPnl": _round_price(open_pnl),
             "totalPnl": _round_price(realized_pnl + open_pnl),
             "closedTrades": len(closed_today),
-            "openTrades": len(active_today),
-            "totalTrades": len(closed_today) + len(active_today),
+            "slTrades": self._daily_sl_count(day_key),
+            "dailyStockSlLimit": DAILY_STOCK_SL_LIMIT,
+            "openTrades": len(active_for_day),
+            "totalTrades": len(closed_today) + len(active_for_day),
             "winningTrades": closed_stats["wins"],
             "losingTrades": closed_stats["losses"],
             "winRate": closed_stats["winRate"],
             "profitFactor": closed_stats["profitFactor"],
             "profitFactorLabel": closed_stats["profitFactorLabel"],
             "availableDates": self._available_report_dates(active_trades),
-            "stockRows": self._group_report_rows(closed_today, active_today, "symbol"),
-            "thesisRows": self._group_report_rows(closed_today, active_today, "thesis"),
+            "stockRows": self._group_report_rows(closed_today, active_for_day, "symbol"),
+            "thesisRows": self._group_report_rows(closed_today, active_for_day, "thesis"),
             "exitRows": self._exit_report_rows(closed_today),
         }
 
@@ -490,6 +476,29 @@ class PaperTradingEngine:
         rows.sort(key=lambda row: row["realizedPnl"] or 0, reverse=True)
         return rows
 
+    def _daily_sl_count(self, day_key: str | None = None) -> int:
+        day = _valid_date_key(day_key) or _today_key()
+        return len([
+            trade for trade in self.closed_trades
+            if _trade_date_key(trade, "exitTime", "closedAt") == day
+            and str(trade.get("exitReason") or trade.get("status") or "").upper() == "SL"
+        ])
+
+    def _daily_stock_sl_count(self, symbol: str, day_key: str | None = None) -> int:
+        day = _valid_date_key(day_key) or _today_key()
+        stock_symbol = str(symbol or "").strip().upper()
+        if not stock_symbol:
+            return 0
+        return len([
+            trade for trade in self.closed_trades
+            if str(trade.get("symbol") or "").strip().upper() == stock_symbol
+            and _trade_date_key(trade, "exitTime", "closedAt") == day
+            and str(trade.get("exitReason") or trade.get("status") or "").upper() == "SL"
+        ])
+
+    def _daily_stock_sl_limit_reached(self, symbol: str) -> bool:
+        return self._daily_stock_sl_count(symbol) >= DAILY_STOCK_SL_LIMIT
+
     def _load(self) -> None:
         if not PAPER_STATE_PATH.exists():
             return
@@ -500,11 +509,16 @@ class PaperTradingEngine:
             self.realized_pnl = _to_float(payload.get("realizedPnl")) or 0.0
             self.candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else {}
             self.fib_watch = payload.get("fibWatch") if isinstance(payload.get("fibWatch"), dict) else {}
+            self.used_confirmations = self._normalize_used_confirmations(payload.get("usedConfirmations"))
             open_trades = payload.get("openTrades") or payload.get("activeTrades")
             self.active_trades = open_trades if isinstance(open_trades, dict) else {}
             self.closed_trades = payload.get("closedTrades") if isinstance(payload.get("closedTrades"), list) else []
             self._normalize_loaded_trades()
-            self.last_ideas = payload.get("ideas") if isinstance(payload.get("ideas"), list) else []
+            self.last_ideas_date = _valid_date_key(payload.get("ideasDate"))
+            if self.last_ideas_date == _today_key() and isinstance(payload.get("ideas"), list):
+                self.last_ideas = payload["ideas"]
+            else:
+                self._clear_last_ideas()
             self.next_trade_id = int(payload.get("nextTradeId") or self._next_trade_id_from_history())
             self.last_saved_at = payload.get("lastSavedAt") or payload.get("savedAt")
             self.persistence_error = None
@@ -521,9 +535,11 @@ class PaperTradingEngine:
             "nextTradeId": self.next_trade_id,
             "candles": self.candles,
             "fibWatch": self.fib_watch,
+            "usedConfirmations": self.used_confirmations,
             "openTrades": self.active_trades,
             "activeTrades": self.active_trades,
             "closedTrades": self.closed_trades,
+            "ideasDate": self.last_ideas_date,
             "ideas": self.last_ideas,
         }
         try:
@@ -535,6 +551,10 @@ class PaperTradingEngine:
             self.persistence_error = None
         except Exception as exc:  # noqa: BLE001 - surface persistence trouble to the UI
             self.persistence_error = f"Could not save paper trading state: {exc}"
+
+    def _clear_last_ideas(self) -> None:
+        self.last_ideas = []
+        self.last_ideas_date = None
 
     def _next_trade_id_from_history(self) -> int:
         max_id = 0
@@ -560,13 +580,38 @@ class PaperTradingEngine:
             trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
 
     @staticmethod
+    def _normalize_used_confirmations(value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            return {}
+        normalized: dict[str, int] = {}
+        for key, bucket in value.items():
+            if not isinstance(key, str):
+                continue
+            number = _to_float(bucket)
+            if number is not None:
+                normalized[key] = int(number)
+        return normalized
+
+    @staticmethod
     def _session_is_open(now: float | None = None) -> bool:
         local_time = time.localtime(now or time.time())
         if local_time.tm_hour > PAPER_START_HOUR:
             return True
         return local_time.tm_hour == PAPER_START_HOUR and local_time.tm_min >= PAPER_START_MINUTE
 
+    @staticmethod
+    def _square_off_due(now: float | None = None) -> bool:
+        local_time = time.localtime(now or time.time())
+        if local_time.tm_hour > PAPER_SQUARE_OFF_HOUR:
+            return True
+        return local_time.tm_hour == PAPER_SQUARE_OFF_HOUR and local_time.tm_min >= PAPER_SQUARE_OFF_MINUTE
+
+    def _entry_session_is_open(self, now: float | None = None) -> bool:
+        return self._session_is_open(now) and not self._square_off_due(now)
+
     def _session_status(self) -> str:
+        if self._square_off_due():
+            return f"Intraday square-off active after {PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}"
         if self._session_is_open():
             return "Paper engine active"
         return f"Waiting until {PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d} to start paper trading"
@@ -628,15 +673,15 @@ class PaperTradingEngine:
         candles = self.candles.get(symbol) or []
         return candles[-2] if len(candles) >= 2 else None
 
-    def _build_ideas(self, stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_ideas(self, stocks: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
         ideas = []
         for stock in stocks:
             side = "BUY" if stock.get("direction") == "gain" else "SHORT"
-            ideas.append(self._vwap_idea(stock, side))
-            ideas.append(self._fib_idea(stock, side))
+            ideas.append(self._vwap_idea(stock, side, now))
+            ideas.append(self._fib_idea(stock, side, now))
         return [idea for idea in ideas if idea]
 
-    def _vwap_idea(self, stock: dict[str, Any], side: str) -> dict[str, Any] | None:
+    def _vwap_idea(self, stock: dict[str, Any], side: str, now: float) -> dict[str, Any] | None:
         price = _to_float(stock.get("current"))
         vwap = _to_float(stock.get("vwap"))
         day_high = _to_float(stock.get("high"))
@@ -662,9 +707,10 @@ class PaperTradingEngine:
             if not retest
             else f"Waiting for M5 {'bullish' if side == 'BUY' else 'bearish'} candle",
             candle,
+            now,
         )
 
-    def _fib_idea(self, stock: dict[str, Any], side: str) -> dict[str, Any] | None:
+    def _fib_idea(self, stock: dict[str, Any], side: str, now: float) -> dict[str, Any] | None:
         price = _to_float(stock.get("current"))
         day_high = _to_float(stock.get("high"))
         day_low = _to_float(stock.get("low"))
@@ -697,6 +743,7 @@ class PaperTradingEngine:
             confirm,
             status,
             candle,
+            now,
             {"zoneLow": zone_low, "zoneHigh": zone_high},
         )
 
@@ -712,6 +759,7 @@ class PaperTradingEngine:
         ready: bool,
         status: str,
         candle: dict[str, Any],
+        now: float,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         quantity = max(1, int(self.trade_allocation // entry)) if entry > 0 else 0
@@ -719,6 +767,28 @@ class PaperTradingEngine:
         loss_if_sl = abs(_trade_pnl(side, entry, stop_loss, quantity))
         profit_if_tp = max(0.0, _trade_pnl(side, entry, target, quantity))
         active_key = self._trade_key(stock["symbol"], thesis)
+        confirmation_key = self._confirmation_key(stock["symbol"], side, thesis)
+        confirmation_bucket = int(_to_float(candle.get("bucket")) or 0)
+        confirmation_fresh = self._confirmation_is_fresh(candle, now)
+        confirmation_used = self.used_confirmations.get(confirmation_key) == confirmation_bucket
+        ready_status = status
+        if active_key in self.active_trades:
+            ready_status = "Already active"
+        elif ready and confirmation_used:
+            ready_status = "Waiting for next M5 confirmation candle"
+        elif ready and not confirmation_fresh:
+            ready_status = f"Confirmation older than {FRESH_CONFIRMATION_SECONDS}s; waiting for next M5 candle"
+        elif ready and (rr is None or rr <= MIN_TRADE_RR):
+            ready_status = f"Rejected: RR must be above {MIN_TRADE_RR}"
+        ready_to_trade = (
+            ready
+            and confirmation_fresh
+            and not confirmation_used
+            and rr is not None
+            and rr > MIN_TRADE_RR
+            and quantity > 0
+            and active_key not in self.active_trades
+        )
         idea = {
             "symbol": stock["symbol"],
             "sector": stock.get("sector") or "-",
@@ -734,13 +804,14 @@ class PaperTradingEngine:
             "profitIfTp": _round_price(profit_if_tp),
             "allocation": self.trade_allocation,
             "quantity": quantity,
-            "ready": bool(ready and rr is not None and rr > MIN_TRADE_RR and quantity > 0 and active_key not in self.active_trades),
-            "status": "Already active"
-            if active_key in self.active_trades
-            else f"Rejected: RR must be above {MIN_TRADE_RR}"
-            if ready and (rr is None or rr <= MIN_TRADE_RR)
-            else status,
+            "ready": bool(ready_to_trade),
+            "status": ready_status,
+            "confirmationKey": confirmation_key,
+            "confirmationBucket": confirmation_bucket,
+            "confirmationFresh": confirmation_fresh,
+            "confirmationUsed": confirmation_used,
             "m5": {
+                "bucket": confirmation_bucket,
                 "open": _round_price(candle["open"]),
                 "high": _round_price(candle["high"]),
                 "low": _round_price(candle["low"]),
@@ -752,6 +823,18 @@ class PaperTradingEngine:
         if extra:
             idea.update({key: _round_price(value) if isinstance(value, float) else value for key, value in extra.items()})
         return idea
+
+    @staticmethod
+    def _confirmation_key(symbol: str, side: str, thesis: str) -> str:
+        return f"{symbol}|{side}|{thesis}"
+
+    @staticmethod
+    def _confirmation_is_fresh(candle: dict[str, Any], now: float) -> bool:
+        bucket = _to_float(candle.get("bucket"))
+        if bucket is None:
+            return False
+        confirmed_at = bucket + M5_SECONDS
+        return 0 <= now - confirmed_at <= FRESH_CONFIRMATION_SECONDS
 
     @staticmethod
     def _candle_confirms(candle: dict[str, Any], side: str) -> bool:
@@ -787,14 +870,26 @@ class PaperTradingEngine:
         for idea in ideas:
             if not idea.get("ready"):
                 continue
+            symbol = str(idea.get("symbol") or "")
+            if self._daily_stock_sl_limit_reached(symbol):
+                idea["ready"] = False
+                idea["status"] = f"{symbol} daily SL limit reached ({DAILY_STOCK_SL_LIMIT}); no new trades for this stock today"
+                continue
             if self.snapshot()["availableCapital"] < self.trade_allocation:
                 idea["ready"] = False
                 idea["status"] = "Ready but capital is fully allocated"
                 continue
             trade = self._trade_from_idea(idea)
             self.active_trades[trade["key"]] = trade
+            self._mark_confirmation_used(idea)
             idea["status"] = "Trade placed"
             idea["ready"] = False
+
+    def _mark_confirmation_used(self, idea: dict[str, Any]) -> None:
+        confirmation_key = str(idea.get("confirmationKey") or "")
+        confirmation_bucket = _to_float(idea.get("confirmationBucket"))
+        if confirmation_key and confirmation_bucket is not None:
+            self.used_confirmations[confirmation_key] = int(confirmation_bucket)
 
     def _trade_from_idea(self, idea: dict[str, Any]) -> dict[str, Any]:
         trade_id = f"PT{self.next_trade_id:04d}"
@@ -817,6 +912,8 @@ class PaperTradingEngine:
             "rr": idea["rr"],
             "lossIfSl": idea["lossIfSl"],
             "profitIfTp": idea["profitIfTp"],
+            "confirmationKey": idea.get("confirmationKey"),
+            "confirmationBucket": idea.get("confirmationBucket"),
             "unrealizedPnl": 0.0,
             "stopMovedToBe": False,
             "stopMoveReason": "",
@@ -857,6 +954,13 @@ class PaperTradingEngine:
                     exit_reason, exit_price = "TP", trade["target"]
             if exit_reason:
                 self._close_trade(key, trade, exit_reason, exit_price)
+
+    def _square_off_open_trades(self) -> None:
+        for key, trade in list(self.active_trades.items()):
+            exit_price = _to_float(trade.get("currentPrice")) or _to_float(trade.get("entry"))
+            if exit_price is None:
+                continue
+            self._close_trade(key, trade, "EOD", exit_price)
 
     def _move_stop_to_break_even(self, trade: dict[str, Any], price: float) -> None:
         if not PAPER_MOVE_SL_TO_BE or trade.get("stopMovedToBe"):
@@ -1073,6 +1177,7 @@ class NSEStreamer:
             data = {
                 **self.state.__dict__,
                 "streaming_label": "On" if self.state.running and clock.get("shouldStream", True) else "Scheduled" if self.state.running else "Off",
+                "sector_selection_rule": self._sector_selection_rule(),
             }
         return data
 
@@ -1260,6 +1365,22 @@ class NSEStreamer:
             "paperLogic": "live NSE prices only; no mock price fallback; completed M5 candles only",
         }
 
+    @staticmethod
+    def _sector_selection_rule() -> dict[str, Any]:
+        return {
+            "buyThreshold": BUY_SECTOR_THRESHOLD,
+            "sellThreshold": SELL_SECTOR_THRESHOLD,
+            "sectorPickCount": SECTOR_PICK_COUNT,
+            "stocksPerSector": STOCKS_PER_SECTOR,
+            "dailyStockSlLimit": DAILY_STOCK_SL_LIMIT,
+            "label": (
+                f"Top {SECTOR_PICK_COUNT} buy >= {BUY_SECTOR_THRESHOLD:+.2f}% / "
+                f"top {SECTOR_PICK_COUNT} sell <= {SELL_SECTOR_THRESHOLD:+.2f}% / "
+                f"{STOCKS_PER_SECTOR} stocks each / "
+                f"{DAILY_STOCK_SL_LIMIT} SL per stock threshold"
+            ),
+        }
+
     def _fetch_sector_stock_groups(self, sector_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         gain_sectors = [
             row for row in sector_rows
@@ -1445,7 +1566,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self._serve_static("index.html", "text/html; charset=utf-8")
         elif path.startswith("/static/"):
             name = path.replace("/static/", "", 1)
-            content_type = "text/css; charset=utf-8" if name.endswith(".css") else "application/javascript; charset=utf-8"
+            content_type = self._static_content_type(name)
             self._serve_static(name, content_type)
         elif path == "/api/status":
             self._json(streamer.status())
@@ -1483,6 +1604,23 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    @staticmethod
+    def _static_content_type(name: str) -> str:
+        suffix = Path(name).suffix.lower()
+        if suffix == ".css":
+            return "text/css; charset=utf-8"
+        if suffix == ".js":
+            return "application/javascript; charset=utf-8"
+        if suffix == ".png":
+            return "image/png"
+        if suffix in {".jpg", ".jpeg"}:
+            return "image/jpeg"
+        if suffix == ".svg":
+            return "image/svg+xml"
+        if suffix == ".ico":
+            return "image/x-icon"
+        return "application/octet-stream"
 
     def _json(self, data: Any, status: int = 200) -> None:
         encoded = json.dumps(data, default=str).encode("utf-8")

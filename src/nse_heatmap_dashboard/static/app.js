@@ -231,6 +231,16 @@ function renderStockGroups(groups) {
   }).join("");
 }
 
+function renderSectorSelectionRule(rule) {
+  const target = q("#stock-selection-rule");
+  if (!target) return;
+  if (rule?.label) {
+    target.textContent = rule.label;
+    return;
+  }
+  target.textContent = "-";
+}
+
 function tradeSideClass(side) {
   return side === "BUY" ? "good" : "bad";
 }
@@ -440,6 +450,7 @@ function renderStatus(status) {
   renderMomentum(rows);
   renderHeatmap(rows);
   renderTable(rows);
+  renderSectorSelectionRule(status.sector_selection_rule);
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
   const liveReport = status.paper_trading?.dailyReport || {};
