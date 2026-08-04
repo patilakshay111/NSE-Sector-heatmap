@@ -212,6 +212,10 @@ button.danger {
   margin-bottom: 14px;
 }
 
+.dashboard-metrics {
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+}
+
 .stock-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(160px, 1fr));
@@ -246,7 +250,8 @@ button.danger {
 }
 
 .metric {
-  padding: 14px;
+  min-width: 0;
+  padding: 12px;
 }
 
 .metric span,
@@ -259,7 +264,8 @@ button.danger {
 .metric strong {
   display: block;
   margin-top: 6px;
-  font-size: 20px;
+  font-size: 18px;
+  overflow-wrap: anywhere;
 }
 
 .leader-grid {
@@ -481,6 +487,12 @@ button.danger {
   border-color: var(--heat-good);
   color: var(--good);
   font-weight: 700;
+}
+
+.log-details {
+  max-width: 520px;
+  white-space: normal;
+  color: var(--muted);
 }
 
 table {

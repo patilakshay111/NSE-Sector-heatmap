@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 import datetime as dt
 from http import cookiejar
@@ -18,6 +19,9 @@ from .config import (
     BUY_SECTOR_THRESHOLD,
     DAILY_STOCK_SL_LIMIT,
     DATA_ROOT,
+    DASHBOARD_HOST,
+    DASHBOARD_PORT,
+    DASHBOARD_URL,
     FRESH_CONFIRMATION_SECONDS,
     IDLE_POLL_SECONDS,
     M5_SECONDS,
@@ -42,12 +46,31 @@ from .config import (
     PAPER_START_MINUTE,
     PAPER_STATE_PATH,
     PAPER_TRADE_ALLOCATION,
+    PRICE_DATA_PROVIDER,
     POLL_SECONDS,
+    PRICE_STREAM_PROVIDER,
+    SECTOR_MOMENTUM_BREAKOUT_BUFFER,
+    SECTOR_MOMENTUM_MAX_ENTRY_EXTENSION,
+    SECTOR_MOMENTUM_MAX_RISK_PCT,
+    SECTOR_MOMENTUM_PARTIAL_EXIT_PCT,
+    SECTOR_MOMENTUM_PARTIAL_EXIT_RR,
+    SECTOR_MOMENTUM_RUNNER_ENABLED,
+    SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR,
+    SECTOR_MOMENTUM_TARGET_RR,
     SECTOR_KEYWORDS,
     SECTOR_PICK_COUNT,
     SELL_SECTOR_THRESHOLD,
     STATIC_ROOT,
     STOCKS_PER_SECTOR,
+    UPSTOX_ACCESS_TOKEN,
+    UPSTOX_API_BASE_URL,
+    UPSTOX_INSTRUMENT_CACHE_PATH,
+    UPSTOX_INSTRUMENT_OVERRIDES,
+    UPSTOX_MAX_STREAM_SYMBOLS,
+    UPSTOX_MARKET_FEED_MODE,
+    UPSTOX_RECONNECT_SECONDS,
+    UPSTOX_WEBSOCKET_ENABLED,
+    USE_UPSTOX_PRICE_DATA,
     VWAP_RETEST_TOLERANCE,
 )
 
@@ -114,6 +137,33 @@ def _first_float(*values: Any) -> float | None:
         if number is not None:
             return number
     return None
+
+
+class AppLog:
+    def __init__(self, limit: int = 300) -> None:
+        self.rows: deque[dict[str, Any]] = deque(maxlen=limit)
+        self.lock = threading.RLock()
+
+    def info(self, message: str, **fields: Any) -> None:
+        self.add("INFO", message, **fields)
+
+    def warn(self, message: str, **fields: Any) -> None:
+        self.add("WARN", message, **fields)
+
+    def add(self, level: str, message: str, **fields: Any) -> None:
+        with self.lock:
+            self.rows.appendleft(
+                {
+                    "time": _now_label(),
+                    "level": level,
+                    "message": message,
+                    "fields": fields,
+                }
+            )
+
+    def latest(self, limit: int = 120) -> list[dict[str, Any]]:
+        with self.lock:
+            return list(self.rows)[:limit]
 
 
 def _clean_index_symbol(symbol: str) -> str:
@@ -326,12 +376,25 @@ class PaperTradingEngine:
             "dailyReport": self.daily_report(active=active),
             "dataPolicy": {
                 "allowMockPrices": False,
-                "priceSource": "NSE live endpoints only",
-                "paperEntryPrice": "current NSE last traded price at signal time",
+                "priceDataProvider": PRICE_DATA_PROVIDER,
+                "priceSource": (
+                    "Upstox prices for selected stocks and active trades; NSE is used for sector shortlisting"
+                    if USE_UPSTOX_PRICE_DATA
+                    else "NSE live endpoints only"
+                ),
+                "paperEntryPrice": (
+                    "current Upstox last traded price at signal time"
+                    if USE_UPSTOX_PRICE_DATA
+                    else "current NSE last traded price at signal time"
+                ),
                 "m5Confirmation": "last completed 5-minute bucket only",
                 "freshConfirmationWindowSeconds": FRESH_CONFIRMATION_SECONDS,
                 "lookAheadBiasGuard": "paper signals never use a still-forming M5 candle",
-                "activeTradeMonitoring": "active trades are marked to live prices whenever the NSE stream is live",
+                "activeTradeMonitoring": (
+                    "active trades are marked immediately from Upstox websocket ticks when enabled; NSE polling remains the fallback"
+                    if UPSTOX_WEBSOCKET_ENABLED
+                    else "active trades are marked to live prices whenever the NSE stream is live"
+                ),
                 "intradaySquareOff": f"open trades auto-close at {PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}",
                 "dailyStockSlLimit": DAILY_STOCK_SL_LIMIT,
             },
@@ -339,6 +402,10 @@ class PaperTradingEngine:
                 "moveSlToBreakEven": PAPER_MOVE_SL_TO_BE,
                 "breakEvenTriggerRr": PAPER_BE_TRIGGER_RR,
                 "profitLockRr": PAPER_BE_LOCK_RR,
+                "sectorMomentumRunnerEnabled": SECTOR_MOMENTUM_RUNNER_ENABLED,
+                "sectorMomentumPartialExitRr": SECTOR_MOMENTUM_PARTIAL_EXIT_RR,
+                "sectorMomentumPartialExitPct": SECTOR_MOMENTUM_PARTIAL_EXIT_PCT,
+                "sectorMomentumRunnerSlLockRr": SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR,
             },
             "ideaCount": len(self.last_ideas),
             "ideasDate": self.last_ideas_date,
@@ -686,9 +753,81 @@ class PaperTradingEngine:
         ideas = []
         for stock in stocks:
             side = "BUY" if stock.get("direction") == "gain" else "SHORT"
+            ideas.append(self._sector_momentum_idea(stock, side, now))
             ideas.append(self._vwap_idea(stock, side, now))
             ideas.append(self._fib_idea(stock, side, now))
         return [idea for idea in ideas if idea]
+
+    def _sector_momentum_idea(self, stock: dict[str, Any], side: str, now: float) -> dict[str, Any] | None:
+        price = _to_float(stock.get("current"))
+        vwap = _to_float(stock.get("vwap"))
+        day_open = _to_float(stock.get("open"))
+        day_high = _to_float(stock.get("high"))
+        day_low = _to_float(stock.get("low"))
+        stock_change = _to_float(stock.get("percentChange"))
+        candle = self._latest_candle(stock["symbol"])
+        if (
+            price is None
+            or vwap is None
+            or day_open is None
+            or day_high is None
+            or day_low is None
+            or stock_change is None
+            or not candle
+        ):
+            return None
+
+        if side == "BUY":
+            trend_aligned = stock.get("direction") == "gain" and stock_change > 0 and price > day_open and price > vwap
+            breakout_price = candle["high"] * (1 + SECTOR_MOMENTUM_BREAKOUT_BUFFER)
+            continuation = price >= breakout_price
+            entry_near_breakout = price <= breakout_price * (1 + SECTOR_MOMENTUM_MAX_ENTRY_EXTENSION)
+        else:
+            trend_aligned = stock.get("direction") == "loss" and stock_change < 0 and price < day_open and price < vwap
+            breakout_price = candle["low"] * (1 - SECTOR_MOMENTUM_BREAKOUT_BUFFER)
+            continuation = price <= breakout_price
+            entry_near_breakout = price >= breakout_price * (1 - SECTOR_MOMENTUM_MAX_ENTRY_EXTENSION)
+
+        confirm = self._candle_confirms(candle, side)
+        entry, stop_loss, target = self._momentum_levels(side, price, candle)
+        risk_pct = abs(entry - stop_loss) / entry if entry > 0 else None
+        risk_ok = risk_pct is not None and risk_pct <= SECTOR_MOMENTUM_MAX_RISK_PCT
+        ready = trend_aligned and continuation and entry_near_breakout and confirm and risk_ok
+        if ready:
+            status = "Ready: sector momentum continuation with M5 breakout"
+        elif not trend_aligned:
+            status = "Waiting for stock to align with sector, VWAP, and day open"
+        elif not continuation:
+            status = "Waiting for live price to break the completed M5 candle"
+        elif not entry_near_breakout:
+            status = "Rejected: entry is too far from the M5 breakout"
+        elif not risk_ok:
+            status = f"Rejected: momentum SL risk is above {SECTOR_MOMENTUM_MAX_RISK_PCT * 100:.2f}%"
+        else:
+            status = f"Waiting for M5 {'bullish' if side == 'BUY' else 'bearish'} continuation candle"
+
+        return self._idea(
+            stock,
+            side,
+            "Sector Momentum",
+            "Trade the strongest sector continuation only after stock direction, VWAP, day open, and completed M5 breakout agree.",
+            entry,
+            stop_loss,
+            target,
+            ready,
+            status,
+            candle,
+            now,
+            {
+                "breakoutPrice": breakout_price,
+                "riskPct": risk_pct * 100 if risk_pct is not None else None,
+                "targetRr": SECTOR_MOMENTUM_TARGET_RR,
+                "runnerEnabled": SECTOR_MOMENTUM_RUNNER_ENABLED,
+                "partialExitRr": SECTOR_MOMENTUM_PARTIAL_EXIT_RR,
+                "partialExitPct": SECTOR_MOMENTUM_PARTIAL_EXIT_PCT,
+                "runnerSlLockRr": SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR,
+            },
+        )
 
     def _vwap_idea(self, stock: dict[str, Any], side: str, now: float) -> dict[str, Any] | None:
         price = _to_float(stock.get("current"))
@@ -861,6 +1000,17 @@ class PaperTradingEngine:
         return price, candle["high"] + buffer, day_low
 
     @staticmethod
+    def _momentum_levels(side: str, price: float, candle: dict[str, Any]) -> tuple[float, float, float]:
+        buffer = max(price * 0.001, 0.05)
+        if side == "BUY":
+            stop_loss = candle["low"] - buffer
+            risk = price - stop_loss
+            return price, stop_loss, price + (risk * SECTOR_MOMENTUM_TARGET_RR)
+        stop_loss = candle["high"] + buffer
+        risk = stop_loss - price
+        return price, stop_loss, price - (risk * SECTOR_MOMENTUM_TARGET_RR)
+
+    @staticmethod
     def _fib_zone(side: str, day_low: float, day_high: float) -> tuple[float, float]:
         span = day_high - day_low
         if side == "BUY":
@@ -923,6 +1073,14 @@ class PaperTradingEngine:
             "profitIfTp": idea["profitIfTp"],
             "confirmationKey": idea.get("confirmationKey"),
             "confirmationBucket": idea.get("confirmationBucket"),
+            "originalQuantity": idea["quantity"],
+            "runnerEnabled": bool(idea["thesis"] == "Sector Momentum" and SECTOR_MOMENTUM_RUNNER_ENABLED),
+            "runnerActive": False,
+            "partialExitDone": False,
+            "partialExitRr": idea.get("partialExitRr"),
+            "partialExitPct": idea.get("partialExitPct"),
+            "runnerSlLockRr": idea.get("runnerSlLockRr"),
+            "tp1": idea["target"],
             "unrealizedPnl": 0.0,
             "stopMovedToBe": False,
             "stopMoveReason": "",
@@ -951,18 +1109,30 @@ class PaperTradingEngine:
             self._move_stop_to_break_even(trade, price)
             exit_reason = None
             exit_price = None
+            stop_loss = _to_float(trade.get("stopLoss"))
+            target = _to_float(trade.get("target"))
+            if stop_loss is None:
+                continue
             if trade["side"] == "BUY":
-                if price <= trade["stopLoss"]:
-                    exit_reason, exit_price = "SL", trade["stopLoss"]
-                elif price >= trade["target"]:
-                    exit_reason, exit_price = "TP", trade["target"]
+                if price <= stop_loss:
+                    exit_reason, exit_price = "SL", stop_loss
+                elif target is not None and price >= target:
+                    exit_reason, exit_price = "TP", target
             else:
-                if price >= trade["stopLoss"]:
-                    exit_reason, exit_price = "SL", trade["stopLoss"]
-                elif price <= trade["target"]:
-                    exit_reason, exit_price = "TP", trade["target"]
+                if price >= stop_loss:
+                    exit_reason, exit_price = "SL", stop_loss
+                elif target is not None and price <= target:
+                    exit_reason, exit_price = "TP", target
             if exit_reason:
+                if exit_reason == "TP" and self._sector_momentum_runner_pending(trade):
+                    self._take_sector_momentum_partial(trade, exit_price, price)
+                    continue
                 self._close_trade(key, trade, exit_reason, exit_price)
+
+    def mark_stream_prices(self, stocks: list[dict[str, Any]]) -> dict[str, Any]:
+        self._mark_active_trades(stocks)
+        self._persist()
+        return self.snapshot()
 
     def _square_off_open_trades(self) -> None:
         for key, trade in list(self.active_trades.items()):
@@ -996,6 +1166,74 @@ class PaperTradingEngine:
         trade["stopLoss"] = _round_price(new_stop)
         trade["stopMovedToBe"] = True
         trade["stopMoveReason"] = f"Moved to BE+{PAPER_BE_LOCK_RR}R after {PAPER_BE_TRIGGER_RR}R"
+
+    @staticmethod
+    def _sector_momentum_runner_pending(trade: dict[str, Any]) -> bool:
+        return (
+            str(trade.get("thesis") or "") == "Sector Momentum"
+            and bool(trade.get("runnerEnabled"))
+            and not bool(trade.get("partialExitDone"))
+        )
+
+    def _take_sector_momentum_partial(self, trade: dict[str, Any], exit_price: float, mark_price: float) -> None:
+        quantity = int(_to_float(trade.get("quantity")) or 0)
+        if quantity <= 0:
+            return
+        partial_quantity = int(quantity * SECTOR_MOMENTUM_PARTIAL_EXIT_PCT)
+        partial_quantity = max(1, partial_quantity)
+        if partial_quantity >= quantity:
+            partial_quantity = quantity - 1
+
+        if partial_quantity > 0:
+            pnl = _trade_pnl(trade["side"], trade["entry"], exit_price, partial_quantity)
+            self.realized_pnl += pnl
+            exit_time = _now_label()
+            allocation = _to_float(trade.get("allocation")) or 0.0
+            closed = {
+                **trade,
+                "id": f"{trade.get('id')}-P1",
+                "parentTradeId": trade.get("id"),
+                "quantity": partial_quantity,
+                "allocation": _round_price((allocation / quantity) * partial_quantity) if quantity else 0,
+                "exitReason": "TP",
+                "exitPrice": _round_price(exit_price),
+                "realizedPnl": _round_price(pnl),
+                "entryTime": trade.get("entryTime") or trade.get("openedAt") or "-",
+                "closedAt": exit_time,
+                "exitTime": exit_time,
+                "status": "TP",
+                "partialExit": True,
+            }
+            self.closed_trades.append(closed)
+            remaining_quantity = quantity - partial_quantity
+            trade["quantity"] = remaining_quantity
+            trade["allocation"] = _round_price((allocation / quantity) * remaining_quantity) if quantity else 0
+
+        trade["partialExitDone"] = True
+        trade["runnerActive"] = True
+        trade["target"] = None
+        self._lock_sector_momentum_runner_stop(trade)
+        trade["unrealizedPnl"] = _round_price(_trade_pnl(trade["side"], trade["entry"], mark_price, trade["quantity"]))
+
+    def _lock_sector_momentum_runner_stop(self, trade: dict[str, Any]) -> None:
+        entry = _to_float(trade.get("entry"))
+        initial_stop = _to_float(trade.get("initialStopLoss") or trade.get("stopLoss"))
+        if entry is None or initial_stop is None:
+            return
+        initial_risk = abs(entry - initial_stop)
+        if initial_risk <= 0:
+            return
+        if trade["side"] == "BUY":
+            locked_stop = entry + (initial_risk * SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR)
+        else:
+            locked_stop = entry - (initial_risk * SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR)
+        trade["stopLoss"] = _round_price(locked_stop)
+        trade["stopMovedToBe"] = True
+        trade["stopMoveReason"] = (
+            f"Momentum TP1 hit; booked {SECTOR_MOMENTUM_PARTIAL_EXIT_PCT * 100:.0f}% "
+            f"and locked runner SL at +{SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR}R"
+        )
+        trade["status"] = "RUNNER"
 
     @staticmethod
     def _current_trade_rr(trade: dict[str, Any], price: float) -> float | None:
@@ -1115,6 +1353,563 @@ class NSEClient:
         }
 
 
+class UpstoxInstrumentResolver:
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.cache_path = UPSTOX_INSTRUMENT_CACHE_PATH
+        self.lock = threading.RLock()
+        self.cache = self._load_cache()
+        self.cache.update(self._override_cache())
+        self.last_error: str | None = None
+
+    def resolve(self, symbols: list[str]) -> dict[str, str]:
+        resolved: dict[str, str] = {}
+        missing = []
+        with self.lock:
+            for symbol in self._clean_symbols(symbols):
+                cached = self.cache.get(symbol)
+                instrument_key = str(cached.get("instrument_key") or "") if isinstance(cached, dict) else ""
+                if instrument_key:
+                    resolved[symbol] = instrument_key
+                else:
+                    missing.append(symbol)
+
+        changed = False
+        for symbol in missing:
+            instrument = self._search_symbol(symbol)
+            if not instrument:
+                continue
+            instrument_key = str(instrument.get("instrument_key") or "")
+            if not instrument_key:
+                continue
+            resolved[symbol] = instrument_key
+            with self.lock:
+                self.cache[symbol] = {
+                    "instrument_key": instrument_key,
+                    "trading_symbol": instrument.get("trading_symbol") or symbol,
+                    "name": instrument.get("name") or instrument.get("short_name") or "",
+                    "resolvedAt": _now_label(),
+                }
+                changed = True
+        if changed:
+            self._save_cache()
+        return resolved
+
+    def _search_symbol(self, symbol: str) -> dict[str, Any] | None:
+        params = parse.urlencode(
+            {
+                "query": symbol,
+                "exchanges": "NSE",
+                "segments": "EQ",
+                "instrument_types": "EQ",
+                "page_number": "1",
+                "records": "10",
+            }
+        )
+        req = request.Request(
+            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=12) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - keep NSE polling alive when Upstox lookup fails
+            self.last_error = f"{symbol}: {exc}"
+            return None
+
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return None
+        symbol_upper = symbol.upper()
+        exact = [
+            row for row in rows
+            if isinstance(row, dict)
+            and str(row.get("segment") or "").upper() == "NSE_EQ"
+            and str(row.get("instrument_type") or "").upper() == "EQ"
+            and str(row.get("trading_symbol") or "").upper() == symbol_upper
+        ]
+        if exact:
+            self.last_error = None
+            return exact[0]
+        fallback = [
+            row for row in rows
+            if isinstance(row, dict)
+            and str(row.get("segment") or "").upper() == "NSE_EQ"
+            and str(row.get("instrument_key") or "").startswith("NSE_EQ|")
+        ]
+        if fallback:
+            self.last_error = None
+            return fallback[0]
+        self.last_error = f"{symbol}: no NSE_EQ instrument found"
+        return None
+
+    def _load_cache(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            str(symbol).upper(): data
+            for symbol, data in payload.items()
+            if isinstance(data, dict)
+        }
+
+    def _save_cache(self) -> None:
+        with self.lock:
+            try:
+                self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                self.cache_path.write_text(json.dumps(self.cache, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                self.last_error = f"Could not save Upstox instrument cache: {exc}"
+
+    @staticmethod
+    def _override_cache() -> dict[str, dict[str, Any]]:
+        overrides = {}
+        for part in UPSTOX_INSTRUMENT_OVERRIDES.replace(",", ";").split(";"):
+            if "=" not in part:
+                continue
+            symbol, instrument_key = part.split("=", 1)
+            clean_symbol = symbol.strip().upper()
+            clean_key = instrument_key.strip()
+            if clean_symbol and clean_key:
+                overrides[clean_symbol] = {
+                    "instrument_key": clean_key,
+                    "trading_symbol": clean_symbol,
+                    "name": "manual override",
+                    "resolvedAt": _now_label(),
+                }
+        return overrides
+
+    @staticmethod
+    def _clean_symbols(symbols: list[str]) -> list[str]:
+        return sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+
+
+class UpstoxPriceStreamer:
+    def __init__(self, on_prices, app_log: AppLog | None = None) -> None:
+        self.on_prices = on_prices
+        self.app_log = app_log
+        self.enabled = UPSTOX_WEBSOCKET_ENABLED
+        self.token = UPSTOX_ACCESS_TOKEN
+        self.mode = UPSTOX_MARKET_FEED_MODE or "ltpc"
+        self.resolver = UpstoxInstrumentResolver(self.token) if self.token else None
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.streamer = None
+        self.connected = False
+        self.desired_keys: set[str] = set()
+        self.subscribed_keys: set[str] = set()
+        self.key_to_symbol: dict[str, str] = {}
+        self.symbol_to_key: dict[str, str] = {}
+        self.latest_ticks: dict[str, dict[str, Any]] = {}
+        self.last_tick_at: str | None = None
+        self.last_error: str | None = None
+        self.last_subscription_at: str | None = None
+        self.resolved_count = 0
+        self.last_rest_quote_at: str | None = None
+        self.last_rest_quote_count = 0
+        self.stream_allowed = False
+        self.reconnect_delay_seconds = max(1, UPSTOX_RECONNECT_SECONDS)
+
+    def quote_stocks(self, stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not USE_UPSTOX_PRICE_DATA:
+            return stocks
+        if not self.token or not self.resolver:
+            self._log("WARN", "Upstox price provider selected but token is missing")
+            return [self._stale_upstox_stock(stock, "Upstox token missing") for stock in stocks]
+        by_symbol = {
+            str(stock.get("symbol") or "").strip().upper(): stock
+            for stock in stocks
+            if str(stock.get("symbol") or "").strip()
+        }
+        if not by_symbol:
+            return stocks
+        resolved = self.resolver.resolve(sorted(by_symbol))
+        keys = [resolved[symbol] for symbol in sorted(by_symbol) if symbol in resolved]
+        if not keys:
+            reason = self.resolver.last_error or "no Upstox instrument keys resolved"
+            self._log("WARN", "No Upstox instrument keys resolved", reason=reason)
+            return [self._stale_upstox_stock(stock, reason) for stock in stocks]
+        try:
+            quote_rows = self._fetch_quote_rows(keys)
+        except Exception as exc:  # noqa: BLE001 - no fake fallback in Upstox mode
+            self._log("WARN", "Upstox REST quote fetch failed", error=str(exc), symbols=len(by_symbol))
+            return [self._stale_upstox_stock(stock, str(exc)) for stock in stocks]
+
+        quoted = []
+        found = 0
+        for stock in stocks:
+            symbol = str(stock.get("symbol") or "").strip().upper()
+            key = resolved.get(symbol)
+            row = self._quote_row_for_symbol(quote_rows, symbol, key)
+            price = _first_float(row.get("last_price"), row.get("ltp"), row.get("lastPrice")) if row else None
+            if price is None:
+                quoted.append(self._stale_upstox_stock(stock, "Upstox quote missing"))
+                continue
+            found += 1
+            ohlc = row.get("ohlc") if isinstance(row.get("ohlc"), dict) else {}
+            quoted.append(
+                {
+                    **stock,
+                    "symbol": symbol,
+                    "current": price,
+                    "last": price,
+                    "vwap": _first_float(row.get("average_price"), stock.get("vwap")),
+                    "open": _first_float(ohlc.get("open"), stock.get("open")),
+                    "high": _first_float(ohlc.get("high"), stock.get("high")),
+                    "low": _first_float(ohlc.get("low"), stock.get("low")),
+                    "volume": _first_float(row.get("volume"), stock.get("volume")),
+                    "upstoxInstrumentKey": key,
+                    "upstoxLastTradeTime": row.get("last_trade_time"),
+                    "dataSource": "Upstox market-quote/quotes",
+                    "priceIsMock": False,
+                }
+            )
+        with self.lock:
+            self.last_rest_quote_at = _now_label()
+            self.last_rest_quote_count = found
+            self.last_error = None if found else self.last_error
+        self._log("INFO", "Upstox REST prices loaded", requested=len(by_symbol), quoted=found)
+        return quoted
+
+    def update_targets(self, stocks: list[dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
+        if not self.token or not self.resolver:
+            with self.lock:
+                self.last_error = "Upstox websocket enabled, but UPSTOX_ACCESS_TOKEN or UPSTOX_ANALYTICS_TOKEN is missing."
+            self._log("WARN", "Upstox websocket enabled but token is missing")
+            return
+        by_symbol = {
+            str(stock.get("symbol") or "").strip().upper(): stock
+            for stock in stocks
+            if str(stock.get("symbol") or "").strip()
+        }
+        if not by_symbol:
+            self._set_desired_keys({}, {})
+            self._sync_subscription()
+            return
+        resolved = self.resolver.resolve(sorted(by_symbol))
+        key_to_symbol = {instrument_key: symbol for symbol, instrument_key in resolved.items()}
+        self._set_desired_keys(resolved, key_to_symbol)
+        if not self.stream_allowed:
+            with self.lock:
+                self.last_error = "Upstox websocket paused outside market hours."
+            return
+        self.start()
+        self._sync_subscription()
+
+    def set_stream_allowed(self, allowed: bool, reason: str = "") -> None:
+        if not self.enabled:
+            return
+        with self.lock:
+            changed = self.stream_allowed != allowed
+            self.stream_allowed = allowed
+        if allowed:
+            if changed:
+                self._log("INFO", "Upstox websocket enabled by market clock", reason=reason)
+            if self.desired_keys:
+                self.start()
+                self._sync_subscription()
+            return
+        if changed:
+            self._log("INFO", "Upstox websocket paused by market clock", reason=reason)
+        self.stop(disconnect=True, clear_targets=False)
+
+    def start(self) -> None:
+        if not self.enabled or not self.stream_allowed:
+            return
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self._run, name="upstox-price-streamer", daemon=True)
+            self.thread.start()
+
+    def stop(self, disconnect: bool = True, clear_targets: bool = False) -> None:
+        self.stop_event.set()
+        with self.lock:
+            stream = self.streamer
+            if clear_targets:
+                self.desired_keys = set()
+                self.symbol_to_key = {}
+                self.key_to_symbol = {}
+        if disconnect and stream:
+            self._call_streamer(stream, "disconnect")
+
+    def status(self) -> dict[str, Any]:
+        with self.lock:
+            latest = sorted(self.latest_ticks.values(), key=lambda tick: str(tick.get("tickTime") or ""), reverse=True)[:8]
+            return {
+                "provider": PRICE_STREAM_PROVIDER,
+                "enabled": self.enabled,
+                "mode": self.mode,
+                "connected": self.connected,
+                "streamAllowed": self.stream_allowed,
+                "reconnectDelaySeconds": self.reconnect_delay_seconds,
+                "maxStreamSymbols": UPSTOX_MAX_STREAM_SYMBOLS,
+                "subscribedSymbols": len(self.symbol_to_key),
+                "subscribedKeys": len(self.subscribed_keys),
+                "desiredKeys": len(self.desired_keys),
+                "resolvedSymbols": self.resolved_count,
+                "lastSubscriptionAt": self.last_subscription_at,
+                "lastTickAt": self.last_tick_at,
+                "lastRestQuoteAt": self.last_rest_quote_at,
+                "lastRestQuoteCount": self.last_rest_quote_count,
+                "lastError": self.last_error or (self.resolver.last_error if self.resolver else None),
+                "latestTicks": latest,
+                "cachePath": str(UPSTOX_INSTRUMENT_CACHE_PATH),
+            }
+
+    def _run(self) -> None:
+        try:
+            import upstox_client  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001 - optional dependency
+            with self.lock:
+                self.last_error = f"Install upstox-python-sdk to enable websocket streaming: {exc}"
+            self._log("WARN", "Upstox SDK missing; websocket disabled", error=str(exc))
+            return
+
+        while not self.stop_event.is_set():
+            with self.lock:
+                allowed = self.stream_allowed
+            if not allowed:
+                if self.stop_event.wait(max(1, UPSTOX_RECONNECT_SECONDS)):
+                    break
+                continue
+            try:
+                configuration = upstox_client.Configuration()
+                configuration.access_token = self.token
+                stream = upstox_client.MarketDataStreamerV3(upstox_client.ApiClient(configuration))
+                stream.on("open", self._on_open)
+                stream.on("message", self._on_message)
+                stream.on("error", self._on_error)
+                stream.on("close", self._on_close)
+                self._call_streamer(stream, "auto_reconnect", False)
+                with self.lock:
+                    self.streamer = stream
+                    self.connected = False
+                    self.last_error = None
+                self._log("INFO", "Opening Upstox websocket")
+                stream.connect()
+                if not self.stop_event.wait(self.reconnect_delay_seconds):
+                    self.reconnect_delay_seconds = min(self.reconnect_delay_seconds * 2, 300)
+            except Exception as exc:  # noqa: BLE001 - reconnect loop keeps polling fallback alive
+                with self.lock:
+                    self.connected = False
+                    self.streamer = None
+                    self.subscribed_keys = set()
+                    self.last_error = f"Upstox websocket stopped: {exc}"
+                self._log("WARN", "Upstox websocket stopped", error=str(exc))
+                if self.stop_event.wait(self.reconnect_delay_seconds):
+                    break
+                self.reconnect_delay_seconds = min(self.reconnect_delay_seconds * 2, 300)
+
+    def _on_open(self, *args) -> None:
+        with self.lock:
+            self.connected = True
+            self.last_error = None
+            self.reconnect_delay_seconds = max(1, UPSTOX_RECONNECT_SECONDS)
+        self._log("INFO", "Upstox websocket connected")
+        self._sync_subscription()
+
+    def _on_close(self, *args) -> None:
+        with self.lock:
+            self.connected = False
+            self.subscribed_keys = set()
+        self._log("WARN", "Upstox websocket closed")
+
+    def _on_error(self, *args) -> None:
+        message = args[-1] if args else "unknown websocket error"
+        with self.lock:
+            self.last_error = str(message)
+        self._log("WARN", "Upstox websocket error", error=str(message))
+
+    def _on_message(self, *args) -> None:
+        message = args[-1] if args else None
+        ticks = self._ticks_from_message(message)
+        if not ticks:
+            return
+        with self.lock:
+            for tick in ticks:
+                self.latest_ticks[tick["symbol"]] = tick
+            self.last_tick_at = _now_label()
+        self._log("INFO", "Upstox websocket tick batch", ticks=len(ticks))
+        self.on_prices(ticks)
+
+    def _set_desired_keys(self, symbol_to_key: dict[str, str], key_to_symbol: dict[str, str]) -> None:
+        with self.lock:
+            self.symbol_to_key = dict(symbol_to_key)
+            self.key_to_symbol = dict(key_to_symbol)
+            self.desired_keys = set(key_to_symbol)
+            self.resolved_count = len(symbol_to_key)
+
+    def _sync_subscription(self) -> None:
+        with self.lock:
+            stream = self.streamer
+            if not self.connected or not stream:
+                return
+            desired = set(self.desired_keys)
+            subscribed = set(self.subscribed_keys)
+        to_subscribe = sorted(desired - subscribed)
+        to_unsubscribe = sorted(subscribed - desired)
+        try:
+            if to_subscribe:
+                self._call_streamer(stream, "subscribe", to_subscribe, self.mode)
+            if to_unsubscribe:
+                self._call_streamer(stream, "unsubscribe", to_unsubscribe)
+            if to_subscribe or to_unsubscribe:
+                with self.lock:
+                    self.subscribed_keys = desired
+                    self.last_subscription_at = _now_label()
+                    self.last_error = None
+                self._log(
+                    "INFO",
+                    "Upstox websocket subscription updated",
+                    subscribed=len(to_subscribe),
+                    unsubscribed=len(to_unsubscribe),
+                    total=len(desired),
+                )
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.last_error = f"Upstox subscription update failed: {exc}"
+            self._log("WARN", "Upstox subscription update failed", error=str(exc))
+
+    @staticmethod
+    def _call_streamer(stream, method_name: str, *args):
+        method = getattr(stream, method_name, None)
+        if method is None and "_" in method_name:
+            parts = method_name.split("_")
+            method = getattr(stream, parts[0] + "".join(part.title() for part in parts[1:]), None)
+        if method is None:
+            return None
+        return method(*args)
+
+    def _ticks_from_message(self, message: Any) -> list[dict[str, Any]]:
+        if isinstance(message, bytes):
+            with self.lock:
+                self.last_error = "Upstox SDK returned raw protobuf bytes; decoded messages are required."
+            return []
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except json.JSONDecodeError:
+                return []
+        if not isinstance(message, dict):
+            return []
+        feeds = message.get("feeds")
+        if not isinstance(feeds, dict):
+            return []
+        ticks = []
+        with self.lock:
+            key_to_symbol = dict(self.key_to_symbol)
+        for instrument_key, feed in feeds.items():
+            key = str(instrument_key or "")
+            symbol = key_to_symbol.get(key)
+            if not symbol:
+                continue
+            price = self._extract_ltp(feed)
+            if price is None:
+                continue
+            ticks.append(
+                {
+                    "symbol": symbol,
+                    "current": price,
+                    "tickTime": _now_label(),
+                    "instrumentKey": key,
+                    "dataSource": "Upstox MarketDataStreamerV3",
+                    "priceIsMock": False,
+                }
+            )
+        return ticks
+
+    def _extract_ltp(self, value: Any) -> float | None:
+        if not isinstance(value, dict):
+            return None
+        ltpc = value.get("ltpc")
+        if isinstance(ltpc, dict):
+            price = _first_float(ltpc.get("ltp"), ltpc.get("last_price"), ltpc.get("lastPrice"))
+            if price is not None:
+                return price
+        for child in value.values():
+            if isinstance(child, dict):
+                price = self._extract_ltp(child)
+                if price is not None:
+                    return price
+        return None
+
+    def _fetch_quote_rows(self, keys: list[str]) -> dict[str, dict[str, Any]]:
+        params = parse.urlencode({"instrument_key": ",".join(keys)})
+        req = request.Request(
+            f"{UPSTOX_API_BASE_URL}/market-quote/quotes?{params}",
+            headers=self._headers(),
+        )
+        with request.urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        return data if isinstance(data, dict) else {}
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            ),
+        }
+
+    @staticmethod
+    def _quote_row_for_symbol(rows: dict[str, dict[str, Any]], symbol: str, key: str | None) -> dict[str, Any]:
+        if not rows:
+            return {}
+        row = rows.get(f"NSE_EQ:{symbol}") or rows.get(key or "")
+        if isinstance(row, dict):
+            return row
+        return next(
+            (
+                value for value in rows.values()
+                if isinstance(value, dict)
+                and (
+                    value.get("instrument_token") == key
+                    or value.get("instrument_key") == key
+                    or str(value.get("symbol") or "").upper() == symbol
+                )
+            ),
+            {},
+        )
+
+    @staticmethod
+    def _stale_upstox_stock(stock: dict[str, Any], reason: str) -> dict[str, Any]:
+        return {
+            **stock,
+            "current": None,
+            "quoteError": reason,
+            "dataSource": "Upstox price unavailable",
+            "priceIsMock": False,
+        }
+
+    def _log(self, level: str, message: str, **fields: Any) -> None:
+        if not self.app_log:
+            return
+        if level == "WARN":
+            self.app_log.warn(message, **fields)
+        else:
+            self.app_log.info(message, **fields)
+
+
 @dataclass
 class FeedState:
     running: bool = False
@@ -1132,6 +1927,7 @@ class FeedState:
     sector_rows: list[dict[str, Any]] = field(default_factory=list)
     sector_stock_groups: list[dict[str, Any]] = field(default_factory=list)
     paper_trading: dict[str, Any] = field(default_factory=dict)
+    price_streaming: dict[str, Any] = field(default_factory=dict)
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
     market_status: dict[str, Any] = field(default_factory=dict)
@@ -1143,8 +1939,10 @@ class FeedState:
 
 class NSEStreamer:
     def __init__(self) -> None:
+        self.app_log = AppLog()
         self.client = NSEClient()
         self.paper_engine = PaperTradingEngine()
+        self.price_streamer = UpstoxPriceStreamer(self._handle_stream_prices, self.app_log)
         self.state = FeedState()
         self.lock = threading.RLock()
         self.paper_lock = threading.RLock()
@@ -1156,6 +1954,7 @@ class NSEStreamer:
         self.market_status_error: str | None = None
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.app_log.info("Dashboard initialized", priceDataProvider=PRICE_DATA_PROVIDER)
 
     def start(self) -> bool:
         with self.lock:
@@ -1167,6 +1966,7 @@ class NSEStreamer:
             self.state.started_at = _now_label()
             self.thread = threading.Thread(target=self._run, name="nse-streamer", daemon=True)
             self.thread.start()
+            self.app_log.info("NSE streamer started", priceDataProvider=PRICE_DATA_PROVIDER)
             return True
 
     def stop(self) -> bool:
@@ -1174,7 +1974,9 @@ class NSEStreamer:
             was_running = self.state.running
             self.state.running = False
             self.stop_event.set()
-            return was_running
+        self.price_streamer.stop()
+        self.app_log.info("Streamer stopped")
+        return was_running
 
     def refresh_once(self) -> dict[str, Any]:
         self._fetch_and_store(force=True)
@@ -1187,8 +1989,14 @@ class NSEStreamer:
                 **self.state.__dict__,
                 "streaming_label": "On" if self.state.running and clock.get("shouldStream", True) else "Scheduled" if self.state.running else "Off",
                 "sector_selection_rule": self._sector_selection_rule(),
+                "price_streaming": self.price_streamer.status(),
+                "price_data_provider": PRICE_DATA_PROVIDER,
+                "logs": self.app_log.latest(80),
             }
         return data
+
+    def logs(self, limit: int = 200) -> list[dict[str, Any]]:
+        return self.app_log.latest(limit)
 
     def close_paper_trade(self, trade_id: str) -> dict[str, Any]:
         with self.paper_lock:
@@ -1197,11 +2005,130 @@ class NSEStreamer:
         with self.lock:
             self.state.paper_trading = paper_trading
             status = self.status()
+        self._refresh_price_stream_targets()
         return {**result, "status": status}
 
     def paper_report(self, date_key: str | None = None) -> dict[str, Any]:
         with self.paper_lock:
             return self.paper_engine.daily_report(date_key)
+
+    def _handle_stream_prices(self, ticks: list[dict[str, Any]]) -> None:
+        if not ticks:
+            return
+        with self.paper_lock:
+            paper_trading = self.paper_engine.mark_stream_prices(ticks)
+        with self.lock:
+            self._overlay_stream_prices_locked(ticks)
+            self.state.paper_trading = paper_trading
+            self.state.price_streaming = self.price_streamer.status()
+        self._refresh_price_stream_targets()
+
+    def _refresh_price_stream_targets(self) -> None:
+        if not UPSTOX_WEBSOCKET_ENABLED:
+            return
+        with self.paper_lock:
+            active_targets = self.paper_engine.active_mark_targets()
+        with self.lock:
+            stock_groups = list(self.state.sector_stock_groups)
+        self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, active_targets))
+
+    def _overlay_stream_prices_locked(self, ticks: list[dict[str, Any]]) -> None:
+        by_symbol = {str(tick.get("symbol") or "").upper(): tick for tick in ticks}
+        if not by_symbol:
+            return
+        for group in self.state.sector_stock_groups:
+            for stock in group.get("stocks") or []:
+                symbol = str(stock.get("symbol") or "").upper()
+                tick = by_symbol.get(symbol)
+                if not tick:
+                    continue
+                price = _to_float(tick.get("current"))
+                if price is None:
+                    continue
+                stock["current"] = _round_price(price)
+                stock["websocketLastTick"] = tick.get("tickTime")
+                stock["websocketInstrumentKey"] = tick.get("instrumentKey")
+                stock["dataSource"] = tick.get("dataSource") or stock.get("dataSource")
+
+    @staticmethod
+    def _price_stream_targets(
+        stock_groups: list[dict[str, Any]],
+        active_targets: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        targets: dict[str, dict[str, Any]] = {}
+        for group in stock_groups:
+            for stock in group.get("stocks") or []:
+                symbol = str(stock.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                targets[symbol] = {
+                    **stock,
+                    "symbol": symbol,
+                    "sector": group.get("sector") or stock.get("sector"),
+                    "direction": group.get("direction") or stock.get("direction"),
+                }
+        for symbol, sector in active_targets.items():
+            clean_symbol = str(symbol or "").strip().upper()
+            if not clean_symbol:
+                continue
+            targets.setdefault(clean_symbol, {"symbol": clean_symbol, "sector": sector, "direction": "active"})
+        return list(targets.values())
+
+    @staticmethod
+    def _apply_price_targets_to_groups(
+        stock_groups: list[dict[str, Any]],
+        price_targets: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        by_symbol = {
+            str(stock.get("symbol") or "").strip().upper(): stock
+            for stock in price_targets
+            if str(stock.get("symbol") or "").strip()
+        }
+        groups = []
+        for group in stock_groups:
+            stocks = []
+            for stock in group.get("stocks") or []:
+                symbol = str(stock.get("symbol") or "").strip().upper()
+                stocks.append({**stock, **by_symbol.get(symbol, {})})
+            groups.append({**group, "stocks": stocks})
+        return groups
+
+    @staticmethod
+    def _stream_subscription_targets(
+        stock_groups: list[dict[str, Any]],
+        active_targets: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        selected_targets = NSEStreamer._price_stream_targets(stock_groups, {})
+        selected_by_symbol = {
+            str(stock.get("symbol") or "").strip().upper(): stock
+            for stock in selected_targets
+            if str(stock.get("symbol") or "").strip()
+        }
+        ordered = []
+        seen = set()
+        for symbol, sector in active_targets.items():
+            clean_symbol = str(symbol or "").strip().upper()
+            if not clean_symbol:
+                continue
+            seen.add(clean_symbol)
+            ordered.append(
+                {
+                    **selected_by_symbol.get(clean_symbol, {}),
+                    "symbol": clean_symbol,
+                    "sector": sector or selected_by_symbol.get(clean_symbol, {}).get("sector"),
+                    "direction": "active",
+                    "streamPriority": "active_trade",
+                }
+            )
+        for stock in selected_targets:
+            symbol = str(stock.get("symbol") or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            if len(ordered) >= max(1, UPSTOX_MAX_STREAM_SYMBOLS):
+                break
+            seen.add(symbol)
+            ordered.append({**stock, "symbol": symbol, "streamPriority": "selected_sector"})
+        return ordered
 
     def _run(self) -> None:
         while not self.stop_event.is_set():
@@ -1225,7 +2152,22 @@ class NSEStreamer:
             stock_groups = self._fetch_sector_stock_groups(parsed["sector_rows"])
             with self.paper_lock:
                 active_targets = self.paper_engine.active_mark_targets()
-            active_quote_stocks = self._fetch_active_trade_marks(active_targets, stock_groups)
+            websocket_allowed = bool(market_clock.get("shouldStream"))
+            self.price_streamer.set_stream_allowed(websocket_allowed, str(market_clock.get("reason") or "market clock"))
+            if USE_UPSTOX_PRICE_DATA:
+                price_targets = self._price_stream_targets(stock_groups, active_targets)
+                upstox_marks = self.price_streamer.quote_stocks(price_targets)
+                stock_groups = self._apply_price_targets_to_groups(stock_groups, upstox_marks)
+                active_quote_stocks = [
+                    stock for stock in upstox_marks
+                    if str(stock.get("symbol") or "").strip().upper() in {symbol.upper() for symbol in active_targets}
+                ]
+            else:
+                active_quote_stocks = self._fetch_active_trade_marks(active_targets, stock_groups)
+            if websocket_allowed:
+                self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, active_targets))
+            else:
+                self.price_streamer.update_targets([])
             with self.paper_lock:
                 paper_trading = self.paper_engine.update(
                     stock_groups,
@@ -1244,12 +2186,21 @@ class NSEStreamer:
                 self.state.market_status = self.market_status_cache or parsed["market_status"]
                 self.state.market_clock = market_clock
                 self.state.data_provenance = self._data_provenance()
+                self.state.price_streaming = self.price_streamer.status()
                 self.state.snapshot_time = parsed["snapshot_time"]
                 self.state.raw_count = parsed["raw_count"]
+            self.app_log.info(
+                "Market refresh stored",
+                sectors=len(parsed["sector_rows"]),
+                selectedGroups=len(stock_groups),
+                activeTrades=len(active_targets),
+                priceDataProvider=PRICE_DATA_PROVIDER,
+            )
         except Exception as exc:  # noqa: BLE001 - surface the feed problem to the UI
             with self.lock:
                 self.state.last_error = str(exc)
                 self.state.market_clock = market_clock
+            self.app_log.warn("Market refresh failed", error=str(exc))
 
     def _set_market_clock(self, clock: dict[str, Any]) -> None:
         with self.paper_lock:
@@ -1259,6 +2210,7 @@ class NSEStreamer:
             self.state.market_status = self.market_status_cache
             self.state.data_provenance = self._data_provenance()
             self.state.paper_trading = paper_trading
+            self.state.price_streaming = self.price_streamer.status()
 
     def _market_clock(self, force: bool = False) -> dict[str, Any]:
         today = dt.datetime.now().date()
@@ -1366,12 +2318,18 @@ class NSEStreamer:
     def _data_provenance(self) -> dict[str, Any]:
         return {
             "mockPricesAllowed": False,
+            "priceDataProvider": PRICE_DATA_PROVIDER,
             "indexFeed": NSE_ALL_INDICES_API,
             "stockFeed": NSE_STOCK_INDICES_API,
             "quoteFeed": NSE_QUOTE_EQUITY_API,
             "holidayFeed": NSE_HOLIDAY_API,
             "marketStatusFeed": NSE_MARKET_STATUS_API,
-            "paperLogic": "live NSE prices only; no mock price fallback; completed M5 candles only",
+            "upstoxPriceStream": "enabled for selected stocks and active paper trades" if UPSTOX_WEBSOCKET_ENABLED else "disabled; NSE polling marks trades",
+            "paperLogic": (
+                "NSE sector shortlist with Upstox prices for entries, candles, and SL/TP; no mock price fallback"
+                if USE_UPSTOX_PRICE_DATA
+                else "live NSE prices only; no mock price fallback; completed M5 candles only"
+            ),
         }
 
     @staticmethod
@@ -1563,7 +2521,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "NSEHeatmapDashboard/0.1"
+    server_version = "NSEHeatmapDashboard/1.0.0"
 
     def log_message(self, format: str, *args):  # noqa: A002
         return
@@ -1579,6 +2537,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._serve_static(name, content_type)
         elif path == "/api/status":
             self._json(streamer.status())
+        elif path == "/api/logs":
+            params = parse.parse_qs(url.query)
+            limit = int(_to_float(params.get("limit", ["200"])[0]) or 200)
+            self._json({"ok": True, "logs": streamer.logs(max(1, min(limit, 300)))})
         elif path == "/api/paper-pnl":
             params = parse.parse_qs(url.query)
             date_key = params.get("date", [""])[0]
@@ -1657,12 +2619,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    host = "127.0.0.1"
-    port = 8775
     streamer.start()
-    server = DashboardHTTPServer((host, port), AppHandler)
-    url = f"http://{host}:{port}"
-    print(f"NSE Heatmap Dashboard: {url}")
+    server = DashboardHTTPServer((DASHBOARD_HOST, DASHBOARD_PORT), AppHandler)
+    print(f"NSE Heatmap Dashboard: {DASHBOARD_URL}")
     print(f"Source: {NSE_HEATMAP_URL}")
     try:
         server.serve_forever()

@@ -33,6 +33,7 @@
       <button class="nav" data-view="paper-dashboard">Paper Dashboard</button>
       <button class="nav" data-view="paper-trades">Paper Trades</button>
       <button class="nav" data-view="paper-pnl">Paper PnL</button>
+      <button class="nav" data-view="logs">Logs</button>
       <button class="nav" data-view="settings">Settings</button>
     </nav>
     <div class="owner-mark">Property of Akshay Patil</div>
@@ -53,13 +54,14 @@
     </header>
 
     <section id="dashboard" class="view active">
-      <div class="metric-grid">
+      <div class="metric-grid dashboard-metrics">
         <article class="metric"><span>Streaming</span><strong id="m-streaming">-</strong></article>
         <article class="metric"><span>Last NSE Tick</span><strong id="m-snapshot">-</strong></article>
         <article class="metric"><span>Last Success</span><strong id="m-success">-</strong></article>
         <article class="metric"><span>Refreshes</span><strong id="m-count">-</strong></article>
         <article class="metric"><span>Sectors</span><strong id="m-sectors">-</strong></article>
-        <article class="metric"><span>Poll Speed</span><strong id="m-speed">-</strong></article>
+        <article class="metric"><span>Price Data</span><strong id="m-price-source">-</strong></article>
+        <article class="metric"><span id="m-speed-label">Poll Speed</span><strong id="m-speed">-</strong></article>
       </div>
 
       <div class="leader-grid">
@@ -299,6 +301,11 @@
           <div><span>Holiday Endpoint</span><strong id="holiday-api-url">-</strong></div>
           <div><span>Market Status Endpoint</span><strong id="market-status-api-url">-</strong></div>
           <div><span>Poll Interval</span><strong id="poll-interval">-</strong></div>
+          <div><span>Price Data Provider</span><strong id="price-data-provider">-</strong></div>
+          <div><span>Price Stream</span><strong id="price-stream-mode">-</strong></div>
+          <div><span>Stream Symbols</span><strong id="price-stream-symbols">-</strong></div>
+          <div><span>Last Stream Tick</span><strong id="price-stream-last-tick">-</strong></div>
+          <div><span>Stream Error</span><strong id="price-stream-error">-</strong></div>
           <div><span>Market Clock</span><strong id="market-clock">-</strong></div>
           <div><span>Next Stream Start</span><strong id="next-open-at">-</strong></div>
           <div><span>Today Holiday</span><strong id="today-holiday">-</strong></div>
@@ -310,6 +317,23 @@
           <div><span>Profit Lock RR</span><strong id="paper-be-lock">-</strong></div>
           <div><span>Last Error</span><strong id="last-error">-</strong></div>
         </div>
+      </div>
+    </section>
+
+    <section id="logs" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Info Logs</h2>
+          <span id="logs-count">-</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th><th>Level</th><th>Message</th><th>Details</th>
+            </tr>
+          </thead>
+          <tbody id="logs-body"></tbody>
+        </table>
       </div>
     </section>
   </main>

@@ -276,7 +276,7 @@ function formatExitTime(value) {
 }
 
 function exitReason(trade) {
-  return String(trade?.exitReason || trade?.status || "ACTIVE").toUpperCase();
+  return String(trade?.exitReason || "ACTIVE").toUpperCase();
 }
 
 function paperTradeStats(trades) {
@@ -529,6 +529,21 @@ function renderSettings(status) {
   q("#holiday-api-url").textContent = status.holiday_api_url || "-";
   q("#market-status-api-url").textContent = status.market_status_api_url || "-";
   q("#poll-interval").textContent = `${status.poll_seconds || 0}s`;
+  const stream = status.price_streaming || {};
+  const priceProvider = status.price_data_provider || status.data_provenance?.priceDataProvider || "nse";
+  q("#price-data-provider").textContent = priceProvider === "upstox" ? "Upstox" : "NSE";
+  q("#price-data-provider").className = priceProvider === "upstox" ? "good" : "";
+  const streamState = !stream.enabled ? "NSE polling" : !stream.streamAllowed ? "paused" : stream.connected ? "connected" : "waiting";
+  q("#price-stream-mode").textContent = stream.enabled
+    ? `${stream.provider || "upstox_websocket"} / ${streamState}`
+    : "NSE polling";
+  q("#price-stream-mode").className = stream.enabled ? (stream.connected ? "good" : "warn") : "";
+  q("#price-stream-symbols").textContent = stream.enabled
+    ? `${stream.subscribedSymbols || 0} symbols / ${stream.subscribedKeys || 0} keys`
+    : "-";
+  q("#price-stream-last-tick").textContent = stream.lastTickAt || "-";
+  q("#price-stream-error").textContent = stream.lastError || "-";
+  q("#price-stream-error").className = stream.lastError ? "bad" : "";
   const clock = status.market_clock || {};
   const nextHoliday = clock.nextHoliday || null;
   q("#market-clock").textContent = `${clock.shouldStream ? "Open" : "Sleeping"} / ${clock.reason || "-"}`;
@@ -550,6 +565,27 @@ function renderSettings(status) {
   q("#last-error").className = status.last_error ? "bad" : "";
 }
 
+function renderLogs(logs) {
+  const rows = logs || [];
+  const body = q("#logs-body");
+  const count = q("#logs-count");
+  if (!body || !count) return;
+  count.textContent = rows.length ? `${rows.length} events` : "No events";
+  body.innerHTML = rows.length ? rows.map((row) => {
+    const fields = row.fields && Object.keys(row.fields).length
+      ? Object.entries(row.fields).map(([key, value]) => `${safe(key)}=${safe(value)}`).join(" / ")
+      : "-";
+    return `
+      <tr>
+        <td>${safe(row.time || "-")}</td>
+        <td class="${row.level === "WARN" ? "warn" : "good"}">${safe(row.level || "INFO")}</td>
+        <td>${safe(row.message || "-")}</td>
+        <td><span class="log-details">${fields}</span></td>
+      </tr>
+    `;
+  }).join("") : "<tr><td colspan=\"4\" class=\"empty-state\">No logs yet.</td></tr>";
+}
+
 function renderStatus(status) {
   state.status = status;
   const rows = status.sector_rows || [];
@@ -565,7 +601,18 @@ function renderStatus(status) {
   q("#m-success").textContent = status.last_success_at || "-";
   q("#m-count").textContent = status.fetch_count || 0;
   q("#m-sectors").textContent = rows.length;
-  q("#m-speed").textContent = `${status.poll_seconds || 0}s`;
+  const priceProvider = status.price_data_provider || status.data_provenance?.priceDataProvider || "nse";
+  q("#m-price-source").textContent = priceProvider === "upstox" ? "Upstox" : "NSE";
+  q("#m-price-source").className = priceProvider === "upstox" ? "good" : "";
+  const stream = status.price_streaming || {};
+  q("#m-speed-label").textContent = priceProvider === "upstox" ? "Price Checks" : "Poll Speed";
+  q("#m-speed").textContent = priceProvider === "upstox"
+    ? stream.connected
+      ? `Live ticks + ${status.poll_seconds || 0}s refresh`
+      : stream.streamAllowed
+        ? `WS waiting + ${status.poll_seconds || 0}s refresh`
+        : `${status.poll_seconds || 0}s refresh`
+    : `${status.poll_seconds || 0}s NSE poll`;
   q("#heatmap-note").textContent = status.streaming_label === "On" ? "Streaming on" : "Streaming off";
 
   renderLeaders(status);
@@ -576,6 +623,7 @@ function renderStatus(status) {
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
   renderPaperTradesIndex(status.paper_trading || {});
+  renderLogs(status.logs || []);
   const liveReport = status.paper_trading?.dailyReport || {};
   if (!state.pnlDate || state.pnlDate === liveReport.date) {
     renderPaperReport(liveReport);

@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 venv/
 *.log
+.run/
 data/
 data/paper_trading_state.json
 data/paper_trading_state.tmp
