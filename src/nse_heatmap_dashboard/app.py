@@ -28,6 +28,27 @@ from .config import (
     MARKET_CLOSE_TIME,
     MARKET_OPEN_TIME,
     MIN_TRADE_RR,
+    NIFTY_OPTIONS_BREAKOUT_BUFFER,
+    NIFTY_OPTIONS_EXPIRY_SKIP_HOUR,
+    NIFTY_OPTIONS_EXPIRY_SKIP_MINUTE,
+    NIFTY_OPTIONS_EXPIRY_WEEKDAY,
+    NIFTY_OPTIONS_INITIAL_CAPITAL,
+    NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+    NIFTY_OPTIONS_LOT_SIZE,
+    NIFTY_OPTIONS_MAX_PREMIUM,
+    NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH,
+    NIFTY_OPTIONS_MAX_SPREAD_PCT,
+    NIFTY_OPTIONS_INDEXES,
+    NIFTY_OPTIONS_MIN_BREADTH,
+    NIFTY_OPTIONS_MIN_OI,
+    NIFTY_OPTIONS_MIN_PREMIUM,
+    NIFTY_OPTIONS_MIN_SECTOR_RATIO,
+    NIFTY_OPTIONS_MIN_VOLUME,
+    NIFTY_OPTIONS_PREMIUM_SL_PCT,
+    NIFTY_OPTIONS_PREMIUM_TARGET_PCT,
+    NIFTY_OPTIONS_STRIKE_INTERVAL,
+    NIFTY_OPTIONS_STRIKE_OFFSET_STEPS,
+    NIFTY_OPTIONS_TRADE_ALLOCATION,
     NSE_ALL_INDICES_API,
     NSE_HEATMAP_URL,
     NSE_HOLIDAY_API,
@@ -46,6 +67,7 @@ from .config import (
     PAPER_START_MINUTE,
     PAPER_STATE_PATH,
     PAPER_TRADE_ALLOCATION,
+    OPTIONS_PAPER_STATE_PATH,
     PRICE_DATA_PROVIDER,
     POLL_SECONDS,
     PRICE_STREAM_PROVIDER,
@@ -68,6 +90,8 @@ from .config import (
     UPSTOX_INSTRUMENT_OVERRIDES,
     UPSTOX_MAX_STREAM_SYMBOLS,
     UPSTOX_MARKET_FEED_MODE,
+    UPSTOX_OPTION_INSTRUMENT_CACHE_PATH,
+    UPSTOX_OPTION_INSTRUMENT_OVERRIDES,
     UPSTOX_RECONNECT_SECONDS,
     UPSTOX_WEBSOCKET_ENABLED,
     USE_UPSTOX_PRICE_DATA,
@@ -204,6 +228,21 @@ def _sector_row(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _index_row(item: dict[str, Any], fallback_symbol: str = "-") -> dict[str, Any]:
+    return {
+        "symbol": _clean_index_symbol(str(item.get("indexSymbol") or item.get("index") or fallback_symbol)),
+        "last": _first_float(item.get("last"), item.get("lastPrice"), item.get("ltp")),
+        "change": _first_float(item.get("variation"), item.get("change")),
+        "percentChange": _first_float(item.get("percentChange"), item.get("perChange"), item.get("pChange")),
+        "previousClose": _first_float(item.get("previousClose"), item.get("previous")),
+        "open": _first_float(item.get("open")),
+        "high": _first_float(item.get("high")),
+        "low": _first_float(item.get("low")),
+        "vwap": _first_float(item.get("vwap"), item.get("averagePrice")),
+        "lastUpdateTime": item.get("lastUpdateTime") or item.get("lastUpdate") or "",
+    }
+
+
 def _quote_price_info(quote_payload: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(quote_payload, dict):
         return {}
@@ -287,6 +326,21 @@ def _trade_pnl(side: str, entry: float, price: float, quantity: int) -> float:
     if side == "BUY":
         return (price - entry) * quantity
     return (entry - price) * quantity
+
+
+def _long_pnl(entry: float, price: float, quantity: int) -> float:
+    return (price - entry) * quantity
+
+
+def _is_transient_socket_error(exc: BaseException) -> bool:
+    if isinstance(exc, (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException) and reason is not exc:
+        return _is_transient_socket_error(reason)
+    winerror = getattr(exc, "winerror", None)
+    errno = getattr(exc, "errno", None)
+    return winerror in {10053, 10054, 10060} or errno in {10053, 10054, 10060}
 
 
 class PaperTradingEngine:
@@ -1279,6 +1333,869 @@ class PaperTradingEngine:
         return closed
 
 
+class NiftyOptionsPaperEngine:
+    def __init__(self) -> None:
+        self.initial_capital = NIFTY_OPTIONS_INITIAL_CAPITAL
+        self.trade_allocation = NIFTY_OPTIONS_TRADE_ALLOCATION
+        self.realized_pnl = 0.0
+        self.candles: dict[str, list[dict[str, Any]]] = {}
+        self.active_trades: dict[str, dict[str, Any]] = {}
+        self.closed_trades: list[dict[str, Any]] = []
+        self.used_confirmations: dict[str, int] = {}
+        self.next_trade_id = 1
+        self.last_ideas: list[dict[str, Any]] = []
+        self.last_option_tiles: list[dict[str, Any]] = []
+        self.last_idea_date: str | None = None
+        self.last_saved_at: str | None = None
+        self.persistence_error: str | None = None
+        self._load()
+
+    def update(
+        self,
+        sector_rows: list[dict[str, Any]],
+        index_spots: dict[str, dict[str, Any]],
+        option_quote_provider,
+        market_open: bool = True,
+    ) -> dict[str, Any]:
+        now = time.time()
+        if market_open:
+            self._mark_active_trades(option_quote_provider)
+            if self._square_off_due(now):
+                self._square_off_open_trades()
+        if not market_open or not self._entry_session_is_open(now):
+            self.last_ideas = self._retained_ideas([], now, self._session_status())
+            if not self.last_ideas:
+                self.last_idea_date = None
+            self._persist()
+            return self.snapshot()
+
+        quote_cache: dict[str, dict[str, Any]] = {}
+
+        def cached_option_quote(contract: dict[str, Any]) -> dict[str, Any]:
+            key = self._trade_key(contract)
+            if key not in quote_cache:
+                quote_cache[key] = option_quote_provider(contract)
+            return quote_cache[key]
+
+        for config in self._enabled_indexes():
+            spot = self._spot_for_index(index_spots, config)
+            self._update_index_candle(config, spot, now)
+        self.last_option_tiles = self._build_option_tiles(index_spots, cached_option_quote, now)
+        self._mark_active_trades(cached_option_quote)
+        ideas = self._build_ideas(sector_rows, index_spots, cached_option_quote, now)
+        self._activate_ideas(ideas)
+        self.last_ideas = self._retained_ideas(ideas, now)
+        self.last_idea_date = _today_key() if ideas else None
+        self._persist()
+        return self.snapshot()
+
+    def snapshot(self) -> dict[str, Any]:
+        active = list(self.active_trades.values())
+        active_allocated = sum(_to_float(trade.get("allocation")) or 0 for trade in active)
+        unrealized_pnl = sum(_to_float(trade.get("unrealizedPnl")) or 0 for trade in active)
+        equity = self.initial_capital + self.realized_pnl + unrealized_pnl
+        closed_count = len(self.closed_trades)
+        winning_trades = [trade for trade in self.closed_trades if (_to_float(trade.get("realizedPnl")) or 0) > 0]
+        losing_trades = [trade for trade in self.closed_trades if (_to_float(trade.get("realizedPnl")) or 0) < 0]
+        gross_profit = sum(_to_float(trade.get("realizedPnl")) or 0 for trade in winning_trades)
+        gross_loss = abs(sum(_to_float(trade.get("realizedPnl")) or 0 for trade in losing_trades))
+        profit_factor = gross_profit / gross_loss if gross_loss else None
+        return {
+            "initialCapital": self.initial_capital,
+            "allocationPerTrade": self.trade_allocation,
+            "availableCapital": self.initial_capital + self.realized_pnl - active_allocated,
+            "allocatedCapital": active_allocated,
+            "realizedPnl": _round_price(self.realized_pnl),
+            "unrealizedPnl": _round_price(unrealized_pnl),
+            "equity": _round_price(equity),
+            "activeCount": len(active),
+            "closedCount": closed_count,
+            "totalTrades": len(active) + closed_count,
+            "winningTrades": len(winning_trades),
+            "losingTrades": len(losing_trades),
+            "winRate": (len(winning_trades) / closed_count) * 100 if closed_count else None,
+            "profitFactor": profit_factor,
+            "profitFactorLabel": f"{profit_factor:.2f}" if profit_factor is not None else "No losses" if gross_profit > 0 else "-",
+            "strategy": self._strategy_config(),
+            "dataPolicy": {
+                "priceSource": "Upstox option quotes only; options are never marked from NSE or mock prices",
+                "signalSource": "NSE sector heatmap plus tradable index spot M5 confirmation",
+                "entryPolicy": "paper option entry requires a resolved Upstox option instrument and live option LTP",
+                "intradaySquareOff": f"open options auto-close at {PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}",
+            },
+            "sessionOpen": self._entry_session_is_open(),
+            "sessionStatus": self._session_status(),
+            "ideasDate": self.last_idea_date,
+            "lastSavedAt": self.last_saved_at,
+            "persistencePath": str(OPTIONS_PAPER_STATE_PATH),
+            "persistenceError": self.persistence_error,
+            "idea": self.last_ideas[0] if self.last_ideas else None,
+            "ideas": self.last_ideas,
+            "optionTiles": self.last_option_tiles,
+            "openTrades": active,
+            "activeTrades": active,
+            "closedTrades": self.closed_trades[-12:],
+            "allTrades": self._all_trades_newest_first(active),
+        }
+
+    def close_trade_by_id(self, trade_id: str, option_quote_provider) -> dict[str, Any]:
+        requested = str(trade_id or "").strip().upper()
+        for key, trade in list(self.active_trades.items()):
+            if str(trade.get("id") or "").upper() != requested:
+                continue
+            self._mark_trade(trade, option_quote_provider)
+            exit_price = _to_float(trade.get("currentPrice")) or _to_float(trade.get("entry"))
+            if exit_price is None:
+                return {"ok": False, "error": f"No current option premium available for {requested}."}
+            closed = self._close_trade(key, trade, "MANUAL", exit_price)
+            self._persist()
+            return {"ok": True, "trade": closed}
+        return {"ok": False, "error": f"Active options trade {requested or '-'} was not found."}
+
+    def _build_ideas(
+        self,
+        sector_rows: list[dict[str, Any]],
+        index_spots: dict[str, dict[str, Any]],
+        option_quote_provider,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        ideas = [
+            self._build_idea(config, sector_rows, index_spots, option_quote_provider, now)
+            for config in self._enabled_indexes()
+        ]
+        ideas = [idea for idea in ideas if idea]
+        ideas.sort(key=lambda idea: (bool(idea.get("ready")), _to_float(idea.get("score")) or 0), reverse=True)
+        return ideas
+
+    def _build_option_tiles(
+        self,
+        index_spots: dict[str, dict[str, Any]],
+        option_quote_provider,
+        now: float,
+    ) -> list[dict[str, Any]]:
+        tiles = []
+        for config in self._enabled_indexes():
+            index_symbol = str(config.get("symbol") or "NIFTY")
+            index_name = str(config.get("name") or index_symbol)
+            spot_row = self._spot_for_index(index_spots, config)
+            spot = _to_float((spot_row or {}).get("last") or (spot_row or {}).get("current"))
+            if spot is None:
+                tiles.append(
+                    {
+                        "underlying": index_name,
+                        "underlyingSymbol": index_symbol,
+                        "spot": None,
+                        "status": f"Waiting for {index_name} spot.",
+                        "contracts": [],
+                        "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
+                    }
+                )
+                continue
+            contracts = []
+            for option_type in ("CE", "PE"):
+                contract = self._contract_for(config, option_type, spot)
+                quote = option_quote_provider(contract)
+                contracts.append(self._option_tile_contract(contract, quote))
+            tiles.append(
+                {
+                    "underlying": index_name,
+                    "underlyingSymbol": index_symbol,
+                    "spot": _round_price(spot),
+                    "status": "Upstox option quotes loaded" if any(c.get("ltp") is not None for c in contracts) else "Waiting for Upstox option quotes",
+                    "contracts": contracts,
+                    "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
+                }
+            )
+        return tiles
+
+    @staticmethod
+    def _option_tile_contract(contract: dict[str, Any], quote: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "symbol": contract.get("symbol"),
+            "underlying": contract.get("underlying"),
+            "underlyingSymbol": contract.get("underlyingSymbol") or contract.get("underlying"),
+            "expiry": contract.get("expiry"),
+            "strike": contract.get("strike"),
+            "optionType": contract.get("optionType"),
+            "instrumentKey": quote.get("instrumentKey") or contract.get("instrumentKey"),
+            "ltp": _round_price(_to_float(quote.get("ltp"))),
+            "change": _round_price(_to_float(quote.get("change"))),
+            "percentChange": _round_price(_to_float(quote.get("percentChange"))),
+            "bid": quote.get("bid"),
+            "ask": quote.get("ask"),
+            "spreadPct": quote.get("spreadPct"),
+            "volume": quote.get("volume"),
+            "oi": quote.get("oi"),
+            "iv": quote.get("iv"),
+            "quoteError": quote.get("quoteError"),
+            "dataSource": quote.get("dataSource"),
+        }
+
+    def _build_idea(
+        self,
+        index_config: dict[str, Any],
+        sector_rows: list[dict[str, Any]],
+        index_spots: dict[str, dict[str, Any]],
+        option_quote_provider,
+        now: float,
+    ) -> dict[str, Any] | None:
+        index_symbol = str(index_config.get("symbol") or "NIFTY")
+        index_name = str(index_config.get("name") or index_symbol)
+        index_spot = self._spot_for_index(index_spots, index_config)
+        if not sector_rows:
+            return self._waiting_idea(index_config, "WAIT", "Waiting for sector heatmap rows.", None, None, now)
+        if not index_spot:
+            return self._waiting_idea(index_config, "WAIT", f"Waiting for {index_name} spot row.", None, None, now)
+
+        spot = _to_float(index_spot.get("last") or index_spot.get("current"))
+        day_open = _to_float(index_spot.get("open"))
+        day_high = _to_float(index_spot.get("high"))
+        day_low = _to_float(index_spot.get("low"))
+        if spot is None or day_open is None or day_high is None or day_low is None:
+            return self._waiting_idea(index_config, "WAIT", f"Waiting for complete {index_name} open/high/low/LTP.", index_spot, None, now)
+
+        candle = self._latest_candle(index_symbol)
+        if not candle:
+            return self._waiting_idea(index_config, "WAIT", f"Waiting for the first completed {index_symbol} M5 candle.", index_spot, None, now)
+
+        bias = self._heatmap_bias(self._sector_universe_rows(sector_rows, index_config))
+        side = self._direction_from_bias(bias, spot, day_open, candle)
+        if not side:
+            return self._waiting_idea(index_config, "WAIT", f"No trade: {index_symbol} heatmap, breadth, spot, and M5 candle are not aligned.", index_spot, bias, now)
+
+        option_type = "CE" if side == "BULLISH" else "PE"
+        confirmation_key = f"INDEX_OPTIONS|{index_symbol}|{option_type}|Heatmap M5"
+        confirmation_bucket = int(_to_float(candle.get("bucket")) or 0)
+        ready_signal = self._spot_breaks_candle(side, spot, candle)
+        confirmation_fresh = PaperTradingEngine._confirmation_is_fresh(candle, now)
+        confirmation_used = self.used_confirmations.get(confirmation_key) == confirmation_bucket
+        contract = self._contract_for(index_config, option_type, spot)
+        quote = option_quote_provider(contract)
+        premium = _to_float(quote.get("ltp"))
+        stop_loss = premium * (1 - NIFTY_OPTIONS_PREMIUM_SL_PCT) if premium is not None else None
+        target = premium * (1 + NIFTY_OPTIONS_PREMIUM_TARGET_PCT) if premium is not None else None
+        lot_size = int(_to_float(index_config.get("lotSize")) or NIFTY_OPTIONS_LOT_SIZE)
+        lots = int(self.trade_allocation // (premium * lot_size)) if premium and premium > 0 else 0
+        quantity = lots * lot_size
+        liquidity_ok, liquidity_status = self._liquidity_status(quote)
+        active_key = self._trade_key(contract)
+        if active_key in self.active_trades:
+            status = "Already active"
+        elif not ready_signal:
+            status = f"Waiting for {index_symbol} to break the completed M5 candle."
+        elif not confirmation_fresh:
+            status = f"Confirmation older than {FRESH_CONFIRMATION_SECONDS}s; waiting for next M5 candle."
+        elif confirmation_used:
+            status = "Waiting for next M5 confirmation candle."
+        elif not liquidity_ok:
+            status = liquidity_status
+        elif quantity <= 0:
+            status = "Option premium is too high for configured allocation."
+        elif self.snapshot()["availableCapital"] < self.trade_allocation:
+            status = "Ready but options capital is fully allocated."
+        else:
+            status = f"Ready: {index_symbol} heatmap options buyer."
+
+        ready = (
+            active_key not in self.active_trades
+            and ready_signal
+            and confirmation_fresh
+            and not confirmation_used
+            and liquidity_ok
+            and quantity > 0
+            and self.snapshot()["availableCapital"] >= self.trade_allocation
+        )
+        score = self._idea_score(bias, ready_signal)
+        generated_at = _now_label()
+        return {
+            "symbol": contract["symbol"],
+            "underlying": index_name,
+            "underlyingSymbol": index_symbol,
+            "side": "BUY",
+            "direction": side,
+            "optionType": option_type,
+            "thesis": "Index Heatmap Options Buyer",
+            "thesisDetail": "Buy index CE/PE only when related heatmap breadth, index spot, and a completed M5 breakout agree.",
+            "expiry": contract["expiry"],
+            "strike": contract["strike"],
+            "instrumentKey": quote.get("instrumentKey") or contract.get("instrumentKey"),
+            "entry": _round_price(premium),
+            "currentPrice": _round_price(premium),
+            "stopLoss": _round_price(stop_loss),
+            "target": _round_price(target),
+            "lots": lots,
+            "lotSize": lot_size,
+            "quantity": quantity,
+            "allocation": self.trade_allocation,
+            "lossIfSl": _round_price((premium - stop_loss) * quantity) if premium is not None and stop_loss is not None else None,
+            "profitIfTp": _round_price((target - premium) * quantity) if premium is not None and target is not None else None,
+            "ready": ready,
+            "status": status,
+            "originalStatus": status,
+            "fresh": True,
+            "stale": False,
+            "generatedAt": generated_at,
+            "lastSeenAt": generated_at,
+            "expiresAfterSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "liquidityStatus": liquidity_status,
+            "spreadPct": quote.get("spreadPct"),
+            "bid": quote.get("bid"),
+            "ask": quote.get("ask"),
+            "volume": quote.get("volume"),
+            "oi": quote.get("oi"),
+            "quoteError": quote.get("quoteError"),
+            "confirmationKey": confirmation_key,
+            "confirmationBucket": confirmation_bucket,
+            "confirmationFresh": confirmation_fresh,
+            "confirmationUsed": confirmation_used,
+            "spot": _round_price(spot),
+            "spotOpen": _round_price(day_open),
+            "spotHigh": _round_price(day_high),
+            "spotLow": _round_price(day_low),
+            "heatmapBias": bias,
+            "score": round(score, 2),
+            "m5": {
+                "bucket": confirmation_bucket,
+                "open": _round_price(candle["open"]),
+                "high": _round_price(candle["high"]),
+                "low": _round_price(candle["low"]),
+                "close": _round_price(candle["close"]),
+                "ticks": candle["ticks"],
+                "startedAt": candle["startedAt"],
+            },
+        }
+
+    def _waiting_idea(
+        self,
+        index_config: dict[str, Any],
+        direction: str,
+        status: str,
+        index_spot: dict[str, Any] | None,
+        bias: dict[str, Any] | None,
+        now: float,
+    ) -> dict[str, Any]:
+        index_symbol = str(index_config.get("symbol") or "NIFTY")
+        index_name = str(index_config.get("name") or index_symbol)
+        generated_at = _now_label()
+        return {
+            "symbol": "-",
+            "underlying": index_name,
+            "underlyingSymbol": index_symbol,
+            "side": "BUY",
+            "direction": direction,
+            "optionType": "-",
+            "thesis": "Index Heatmap Options Buyer",
+            "thesisDetail": "Buy index CE/PE only when related heatmap breadth, index spot, and a completed M5 breakout agree.",
+            "ready": False,
+            "status": status,
+            "originalStatus": status,
+            "fresh": True,
+            "stale": False,
+            "generatedAt": generated_at,
+            "lastSeenAt": generated_at,
+            "expiresAfterSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "spot": _round_price(_to_float((index_spot or {}).get("last") or (index_spot or {}).get("current"))),
+            "heatmapBias": bias,
+            "score": round(self._idea_score(bias or {}, False), 2),
+            "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
+        }
+
+    def _retained_ideas(
+        self,
+        fresh_ideas: list[dict[str, Any]],
+        now: float,
+        stale_reason: str = "Retained from previous refresh.",
+    ) -> list[dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for idea in fresh_ideas:
+            idea["originalStatus"] = self._base_idea_status(idea)
+            merged[self._idea_display_key(idea)] = idea
+        for old in self.last_ideas:
+            key = self._idea_display_key(old)
+            if key in merged:
+                continue
+            if not self._idea_is_recent(old, now):
+                continue
+            retained = {**old}
+            retained["ready"] = False
+            retained["fresh"] = False
+            retained["stale"] = True
+            retained["originalStatus"] = self._base_idea_status(old)
+            retained["status"] = f"{stale_reason} Last signal: {retained['originalStatus']}"
+            merged[key] = retained
+        ideas = list(merged.values())
+        ideas.sort(key=lambda idea: (bool(idea.get("fresh")), bool(idea.get("ready")), _to_float(idea.get("score")) or 0), reverse=True)
+        return ideas
+
+    @staticmethod
+    def _idea_display_key(idea: dict[str, Any]) -> str:
+        return "|".join(
+            [
+                str(idea.get("underlyingSymbol") or idea.get("underlying") or ""),
+                str(idea.get("optionType") or ""),
+                str(idea.get("strike") or ""),
+                str(idea.get("expiry") or ""),
+            ]
+        )
+
+    @staticmethod
+    def _base_idea_status(idea: dict[str, Any]) -> str:
+        text = str(idea.get("originalStatus") or idea.get("status") or "-")
+        marker = "Last signal:"
+        while marker in text:
+            text = text.split(marker, 1)[1].strip()
+        return text[:180] + "..." if len(text) > 180 else text
+
+    @staticmethod
+    def _idea_is_recent(idea: dict[str, Any], now: float) -> bool:
+        text = str(idea.get("lastSeenAt") or idea.get("generatedAt") or "")
+        parts = text.strip().split()
+        stamp_text = " ".join(parts[:2]) if len(parts) >= 2 else text.strip()
+        try:
+            stamp = dt.datetime.strptime(stamp_text, "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return False
+        return 0 <= now - stamp <= NIFTY_OPTIONS_IDEA_RETENTION_SECONDS
+
+    def _activate_ideas(self, ideas: list[dict[str, Any]]) -> None:
+        placed = 0
+        for idea in ideas:
+            if placed >= max(1, NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH):
+                if idea.get("ready"):
+                    idea["ready"] = False
+                    idea["status"] = "Ready but another higher-ranked options setup was placed this refresh."
+                continue
+            if not idea.get("ready"):
+                continue
+            trade = self._trade_from_idea(idea)
+            self.active_trades[trade["key"]] = trade
+            self.used_confirmations[str(idea.get("confirmationKey") or "")] = int(_to_float(idea.get("confirmationBucket")) or 0)
+            idea["status"] = "Options paper trade placed."
+            idea["ready"] = False
+            placed += 1
+
+    def _trade_from_idea(self, idea: dict[str, Any]) -> dict[str, Any]:
+        trade_id = f"OPT{self.next_trade_id:04d}"
+        self.next_trade_id += 1
+        entry_time = _now_label()
+        return {
+            "id": trade_id,
+            "key": self._trade_key(idea),
+            "symbol": idea["symbol"],
+            "underlying": idea["underlying"],
+            "underlyingSymbol": idea.get("underlyingSymbol"),
+            "side": "BUY",
+            "direction": idea["direction"],
+            "optionType": idea["optionType"],
+            "thesis": idea["thesis"],
+            "expiry": idea["expiry"],
+            "strike": idea["strike"],
+            "instrumentKey": idea.get("instrumentKey"),
+            "entry": idea["entry"],
+            "currentPrice": idea["currentPrice"],
+            "stopLoss": idea["stopLoss"],
+            "initialStopLoss": idea["stopLoss"],
+            "target": idea["target"],
+            "lots": idea["lots"],
+            "lotSize": idea["lotSize"],
+            "quantity": idea["quantity"],
+            "allocation": self.trade_allocation,
+            "unrealizedPnl": 0.0,
+            "confirmationKey": idea.get("confirmationKey"),
+            "confirmationBucket": idea.get("confirmationBucket"),
+            "entrySpot": idea.get("spot"),
+            "entryTime": entry_time,
+            "openedAt": entry_time,
+            "status": "ACTIVE",
+        }
+
+    def _mark_active_trades(self, option_quote_provider) -> None:
+        for key, trade in list(self.active_trades.items()):
+            self._mark_trade(trade, option_quote_provider)
+            price = _to_float(trade.get("currentPrice"))
+            stop_loss = _to_float(trade.get("stopLoss"))
+            target = _to_float(trade.get("target"))
+            if price is None or stop_loss is None:
+                continue
+            if price <= stop_loss:
+                self._close_trade(key, trade, "SL", stop_loss)
+            elif target is not None and price >= target:
+                self._close_trade(key, trade, "TP", target)
+
+    def _mark_trade(self, trade: dict[str, Any], option_quote_provider) -> None:
+        quote = option_quote_provider(trade)
+        price = _to_float(quote.get("ltp"))
+        if price is None:
+            trade["quoteError"] = quote.get("quoteError") or "Upstox option quote missing"
+            return
+        trade["currentPrice"] = _round_price(price)
+        trade["unrealizedPnl"] = _round_price(_long_pnl(trade["entry"], price, trade["quantity"]))
+        trade["bid"] = quote.get("bid")
+        trade["ask"] = quote.get("ask")
+        trade["spreadPct"] = quote.get("spreadPct")
+        trade["volume"] = quote.get("volume")
+        trade["oi"] = quote.get("oi")
+        trade["quoteError"] = None
+
+    def _square_off_open_trades(self) -> None:
+        for key, trade in list(self.active_trades.items()):
+            exit_price = _to_float(trade.get("currentPrice")) or _to_float(trade.get("entry"))
+            if exit_price is not None:
+                self._close_trade(key, trade, "EOD", exit_price)
+
+    def _close_trade(self, key: str, trade: dict[str, Any], exit_reason: str, exit_price: float) -> dict[str, Any]:
+        pnl = _long_pnl(trade["entry"], exit_price, trade["quantity"])
+        self.realized_pnl += pnl
+        exit_time = _now_label()
+        closed = {
+            **trade,
+            "exitReason": exit_reason,
+            "exitPrice": _round_price(exit_price),
+            "realizedPnl": _round_price(pnl),
+            "entryTime": trade.get("entryTime") or trade.get("openedAt") or "-",
+            "closedAt": exit_time,
+            "exitTime": exit_time,
+            "status": exit_reason,
+        }
+        self.closed_trades.append(closed)
+        self.active_trades.pop(key, None)
+        return closed
+
+    def _update_index_candle(self, index_config: dict[str, Any], index_spot: dict[str, Any] | None, now: float) -> None:
+        price = _to_float((index_spot or {}).get("last") or (index_spot or {}).get("current"))
+        if price is None:
+            return
+        index_symbol = str(index_config.get("symbol") or (index_spot or {}).get("symbol") or "NIFTY")
+        bucket = int(now // M5_SECONDS) * M5_SECONDS
+        candles = self.candles.setdefault(index_symbol, [])
+        if not candles or candles[-1]["bucket"] != bucket:
+            candles.append(
+                {
+                    "bucket": bucket,
+                    "startedAt": time.strftime("%H:%M:%S", time.localtime(bucket)),
+                    "open": price,
+                    "high": price,
+                    "low": price,
+                    "close": price,
+                    "ticks": 1,
+                }
+            )
+            del candles[:-12]
+            return
+        candle = candles[-1]
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+        candle["ticks"] += 1
+
+    def _latest_candle(self, symbol: str) -> dict[str, Any] | None:
+        candles = self.candles.get(symbol) or []
+        return candles[-2] if len(candles) >= 2 else None
+
+    def _enabled_indexes(self) -> list[dict[str, Any]]:
+        return [dict(config) for config in NIFTY_OPTIONS_INDEXES if config.get("enabled", True)]
+
+    @staticmethod
+    def _spot_for_index(
+        index_spots: dict[str, dict[str, Any]],
+        index_config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not isinstance(index_spots, dict):
+            return None
+        keys = [
+            str(index_config.get("symbol") or ""),
+            str(index_config.get("nseSymbol") or ""),
+            str(index_config.get("name") or ""),
+        ]
+        normalized = {str(key or "").strip().upper(): value for key, value in index_spots.items()}
+        for key in keys:
+            spot = normalized.get(key.strip().upper())
+            if spot:
+                return spot
+        nse_symbol = str(index_config.get("nseSymbol") or "").strip().upper()
+        if nse_symbol:
+            return next(
+                (
+                    spot for spot in index_spots.values()
+                    if _clean_index_symbol(str(spot.get("symbol") or "")).upper() == nse_symbol
+                ),
+                None,
+            )
+        return None
+
+    @staticmethod
+    def _sector_universe_rows(
+        sector_rows: list[dict[str, Any]],
+        index_config: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        wanted = {
+            str(symbol or "").strip().upper()
+            for symbol in (index_config.get("sectorSymbols") or ())
+            if str(symbol or "").strip()
+        }
+        if not wanted:
+            return sector_rows
+        rows = [
+            row for row in sector_rows
+            if _clean_index_symbol(str(row.get("symbol") or "")).upper() in wanted
+        ]
+        return rows or sector_rows
+
+    def _heatmap_bias(self, sector_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        valid = [row for row in sector_rows if _to_float(row.get("percentChange")) is not None]
+        total = len(valid)
+        green = len([row for row in valid if (_to_float(row.get("percentChange")) or 0) > 0])
+        red = len([row for row in valid if (_to_float(row.get("percentChange")) or 0) < 0])
+        total_breadth_count = sum((row.get("advances") or 0) + (row.get("declines") or 0) + (row.get("unchanged") or 0) for row in valid)
+        net_breadth = (
+            sum((row.get("advances") or 0) - (row.get("declines") or 0) for row in valid) / total_breadth_count
+            if total_breadth_count
+            else 0
+        )
+        top_gain = max((_to_float(row.get("percentChange")) or 0 for row in valid), default=0)
+        top_loss = min((_to_float(row.get("percentChange")) or 0 for row in valid), default=0)
+        return {
+            "totalSectors": total,
+            "greenSectors": green,
+            "redSectors": red,
+            "greenRatio": (green / total) if total else 0,
+            "redRatio": (red / total) if total else 0,
+            "netBreadth": net_breadth,
+            "topGain": top_gain,
+            "topLoss": top_loss,
+        }
+
+    @staticmethod
+    def _idea_score(bias: dict[str, Any], ready_signal: bool) -> float:
+        top_gain = abs(_to_float(bias.get("topGain")) or 0)
+        top_loss = abs(_to_float(bias.get("topLoss")) or 0)
+        breadth = abs(_to_float(bias.get("netBreadth")) or 0)
+        green_ratio = _to_float(bias.get("greenRatio")) or 0
+        red_ratio = _to_float(bias.get("redRatio")) or 0
+        return max(top_gain, top_loss) + (breadth * 3) + (max(green_ratio, red_ratio) * 2) + (1 if ready_signal else 0)
+
+    def _direction_from_bias(self, bias: dict[str, Any], spot: float, day_open: float, candle: dict[str, Any]) -> str | None:
+        bullish = (
+            (_to_float(bias.get("topGain")) or 0) >= BUY_SECTOR_THRESHOLD
+            and (_to_float(bias.get("greenRatio")) or 0) >= NIFTY_OPTIONS_MIN_SECTOR_RATIO
+            and (_to_float(bias.get("netBreadth")) or 0) >= NIFTY_OPTIONS_MIN_BREADTH
+            and spot > day_open
+            and PaperTradingEngine._candle_confirms(candle, "BUY")
+        )
+        bearish = (
+            (_to_float(bias.get("topLoss")) or 0) <= SELL_SECTOR_THRESHOLD
+            and (_to_float(bias.get("redRatio")) or 0) >= NIFTY_OPTIONS_MIN_SECTOR_RATIO
+            and (_to_float(bias.get("netBreadth")) or 0) <= -NIFTY_OPTIONS_MIN_BREADTH
+            and spot < day_open
+            and PaperTradingEngine._candle_confirms(candle, "SHORT")
+        )
+        if bullish == bearish:
+            return None
+        return "BULLISH" if bullish else "BEARISH"
+
+    @staticmethod
+    def _spot_breaks_candle(direction: str, spot: float, candle: dict[str, Any]) -> bool:
+        if direction == "BULLISH":
+            return spot >= candle["high"] * (1 + NIFTY_OPTIONS_BREAKOUT_BUFFER)
+        return spot <= candle["low"] * (1 - NIFTY_OPTIONS_BREAKOUT_BUFFER)
+
+    @staticmethod
+    def _contract_for(index_config: dict[str, Any], option_type: str, spot: float) -> dict[str, Any]:
+        index_symbol = str(index_config.get("symbol") or "NIFTY")
+        strike_interval = int(_to_float(index_config.get("strikeInterval")) or NIFTY_OPTIONS_STRIKE_INTERVAL)
+        base = round(spot / strike_interval) * strike_interval
+        offset = NIFTY_OPTIONS_STRIKE_OFFSET_STEPS * strike_interval
+        strike = base + offset if option_type == "CE" else base - offset
+        expiry = NiftyOptionsPaperEngine._nearest_expiry_date()
+        symbol = f"{index_symbol} {expiry.strftime('%d%b%Y').upper()} {int(strike)} {option_type}"
+        return {
+            "symbol": symbol,
+            "underlying": index_symbol,
+            "underlyingSymbol": index_symbol,
+            "expiry": _date_key(expiry),
+            "strike": int(strike),
+            "optionType": option_type,
+            "lotSize": int(_to_float(index_config.get("lotSize")) or NIFTY_OPTIONS_LOT_SIZE),
+        }
+
+    @staticmethod
+    def _nearest_expiry_date(now: dt.datetime | None = None) -> dt.date:
+        now = now or dt.datetime.now()
+        days = (NIFTY_OPTIONS_EXPIRY_WEEKDAY - now.weekday()) % 7
+        expiry = now.date() + dt.timedelta(days=days)
+        skip_time = dt.time(NIFTY_OPTIONS_EXPIRY_SKIP_HOUR, NIFTY_OPTIONS_EXPIRY_SKIP_MINUTE)
+        if days == 0 and now.time() >= skip_time:
+            expiry += dt.timedelta(days=7)
+        return expiry
+
+    @staticmethod
+    def _liquidity_status(quote: dict[str, Any]) -> tuple[bool, str]:
+        if quote.get("quoteError"):
+            return False, str(quote["quoteError"])
+        premium = _to_float(quote.get("ltp"))
+        if premium is None:
+            return False, "Waiting for Upstox option LTP."
+        if premium < NIFTY_OPTIONS_MIN_PREMIUM or premium > NIFTY_OPTIONS_MAX_PREMIUM:
+            return False, f"Rejected: premium outside {NIFTY_OPTIONS_MIN_PREMIUM:.0f}-{NIFTY_OPTIONS_MAX_PREMIUM:.0f}."
+        spread_pct = _to_float(quote.get("spreadPct"))
+        if spread_pct is None:
+            return False, "Waiting for Upstox bid/ask spread."
+        if spread_pct > NIFTY_OPTIONS_MAX_SPREAD_PCT * 100:
+            return False, f"Rejected: spread above {NIFTY_OPTIONS_MAX_SPREAD_PCT * 100:.1f}%."
+        volume = _to_float(quote.get("volume"))
+        if volume is not None and volume < NIFTY_OPTIONS_MIN_VOLUME:
+            return False, f"Rejected: volume below {NIFTY_OPTIONS_MIN_VOLUME}."
+        oi = _to_float(quote.get("oi"))
+        if oi is not None and oi < NIFTY_OPTIONS_MIN_OI:
+            return False, f"Rejected: OI below {NIFTY_OPTIONS_MIN_OI}."
+        return True, "Liquidity OK."
+
+    @staticmethod
+    def _trade_key(contract: dict[str, Any]) -> str:
+        underlying = str(contract.get("underlyingSymbol") or contract.get("underlying") or "NIFTY").upper()
+        return "|".join(
+            [
+                underlying,
+                str(contract.get("expiry") or ""),
+                str(contract.get("strike") or ""),
+                str(contract.get("optionType") or ""),
+            ]
+        )
+
+    @staticmethod
+    def _session_is_open(now: float | None = None) -> bool:
+        return PaperTradingEngine._session_is_open(now)
+
+    @staticmethod
+    def _square_off_due(now: float | None = None) -> bool:
+        return PaperTradingEngine._square_off_due(now)
+
+    def _entry_session_is_open(self, now: float | None = None) -> bool:
+        return self._session_is_open(now) and not self._square_off_due(now)
+
+    def _session_status(self) -> str:
+        if self._square_off_due():
+            return f"Options square-off active after {PAPER_SQUARE_OFF_HOUR:02d}:{PAPER_SQUARE_OFF_MINUTE:02d}"
+        if self._session_is_open():
+            return "Options paper engine active"
+        return f"Waiting until {PAPER_START_HOUR:02d}:{PAPER_START_MINUTE:02d} to start options paper trading"
+
+    def _all_trades_newest_first(self, active: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        trades = [*active, *self.closed_trades]
+        return sorted(
+            trades,
+            key=lambda trade: str(trade.get("entryTime") or trade.get("openedAt") or ""),
+            reverse=True,
+        )
+
+    def _load(self) -> None:
+        if not OPTIONS_PAPER_STATE_PATH.exists():
+            return
+        try:
+            payload = json.loads(OPTIONS_PAPER_STATE_PATH.read_text(encoding="utf-8"))
+            self.initial_capital = _to_float(payload.get("initialCapital")) or NIFTY_OPTIONS_INITIAL_CAPITAL
+            self.trade_allocation = _to_float(payload.get("allocationPerTrade")) or NIFTY_OPTIONS_TRADE_ALLOCATION
+            self.realized_pnl = _to_float(payload.get("realizedPnl")) or 0.0
+            self.candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else {}
+            self.used_confirmations = PaperTradingEngine._normalize_used_confirmations(payload.get("usedConfirmations"))
+            open_trades = payload.get("openTrades") or payload.get("activeTrades")
+            self.active_trades = open_trades if isinstance(open_trades, dict) else {}
+            self.closed_trades = payload.get("closedTrades") if isinstance(payload.get("closedTrades"), list) else []
+            self.last_idea_date = _valid_date_key(payload.get("ideasDate"))
+            if self.last_idea_date == _today_key() and isinstance(payload.get("ideas"), list):
+                self.last_ideas = payload["ideas"]
+            elif self.last_idea_date == _today_key() and isinstance(payload.get("idea"), dict):
+                self.last_ideas = [payload["idea"]]
+            else:
+                self.last_ideas = []
+            self.last_option_tiles = payload.get("optionTiles") if isinstance(payload.get("optionTiles"), list) else []
+            self.next_trade_id = int(payload.get("nextTradeId") or self._next_trade_id_from_history())
+            self.last_saved_at = payload.get("lastSavedAt") or payload.get("savedAt")
+            self._normalize_loaded_trades()
+            self.persistence_error = None
+        except Exception as exc:  # noqa: BLE001
+            self.persistence_error = f"Could not load options paper trading state: {exc}"
+
+    def _persist(self) -> None:
+        payload = {
+            "schemaVersion": 1,
+            "savedAt": _now_label(),
+            "initialCapital": self.initial_capital,
+            "allocationPerTrade": self.trade_allocation,
+            "realizedPnl": self.realized_pnl,
+            "nextTradeId": self.next_trade_id,
+            "candles": self.candles,
+            "usedConfirmations": self.used_confirmations,
+            "openTrades": self.active_trades,
+            "activeTrades": self.active_trades,
+            "closedTrades": self.closed_trades,
+            "ideasDate": self.last_idea_date,
+            "ideas": self.last_ideas,
+            "optionTiles": self.last_option_tiles,
+        }
+        try:
+            DATA_ROOT.mkdir(parents=True, exist_ok=True)
+            temp_path = OPTIONS_PAPER_STATE_PATH.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+            temp_path.replace(OPTIONS_PAPER_STATE_PATH)
+            self.last_saved_at = payload["savedAt"]
+            self.persistence_error = None
+        except Exception as exc:  # noqa: BLE001
+            self.persistence_error = f"Could not save options paper trading state: {exc}"
+
+    def _normalize_loaded_trades(self) -> None:
+        for trade in self.active_trades.values():
+            trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
+            trade["openedAt"] = trade["entryTime"]
+            trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+        for trade in self.closed_trades:
+            trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
+            trade["openedAt"] = trade["entryTime"]
+            trade["exitTime"] = trade.get("exitTime") or trade.get("closedAt") or "-"
+            trade["closedAt"] = trade["exitTime"]
+            trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+
+    def _next_trade_id_from_history(self) -> int:
+        max_id = 0
+        for trade in [*self.active_trades.values(), *self.closed_trades]:
+            text = str(trade.get("id") or "")
+            if text.startswith("OPT") and text[3:].isdigit():
+                max_id = max(max_id, int(text[3:]))
+        return max_id + 1
+
+    @staticmethod
+    def _strategy_config() -> dict[str, Any]:
+        return {
+            "initialCapital": NIFTY_OPTIONS_INITIAL_CAPITAL,
+            "allocationPerTrade": NIFTY_OPTIONS_TRADE_ALLOCATION,
+            "lotSize": NIFTY_OPTIONS_LOT_SIZE,
+            "strikeInterval": NIFTY_OPTIONS_STRIKE_INTERVAL,
+            "expiryWeekday": NIFTY_OPTIONS_EXPIRY_WEEKDAY,
+            "minSectorRatio": NIFTY_OPTIONS_MIN_SECTOR_RATIO,
+            "minBreadth": NIFTY_OPTIONS_MIN_BREADTH,
+            "breakoutBufferPct": NIFTY_OPTIONS_BREAKOUT_BUFFER * 100,
+            "premiumSlPct": NIFTY_OPTIONS_PREMIUM_SL_PCT * 100,
+            "premiumTargetPct": NIFTY_OPTIONS_PREMIUM_TARGET_PCT * 100,
+            "minPremium": NIFTY_OPTIONS_MIN_PREMIUM,
+            "maxPremium": NIFTY_OPTIONS_MAX_PREMIUM,
+            "maxSpreadPct": NIFTY_OPTIONS_MAX_SPREAD_PCT * 100,
+            "minVolume": NIFTY_OPTIONS_MIN_VOLUME,
+            "minOi": NIFTY_OPTIONS_MIN_OI,
+            "maxNewTradesPerRefresh": NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH,
+            "ideaRetentionSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "indexes": [
+                {
+                    "symbol": config.get("symbol"),
+                    "name": config.get("name"),
+                    "lotSize": config.get("lotSize"),
+                    "strikeInterval": config.get("strikeInterval"),
+                    "enabled": config.get("enabled", True),
+                }
+                for config in NIFTY_OPTIONS_INDEXES
+            ],
+        }
+
+
 class NSEClient:
     def __init__(self) -> None:
         self.cookies = cookiejar.CookieJar()
@@ -1331,15 +2248,29 @@ class NSEClient:
         if not force and time.time() - self.last_cookie_refresh < 60 and list(self.cookies):
             return
         req = request.Request(warm_url, headers=self._headers(NSE_HOME))
-        with self.opener.open(req, timeout=15) as response:
+        with self._open_with_transient_retry(req, timeout=15) as response:
             response.read(2048)
         self.last_cookie_refresh = time.time()
 
     def _get_json(self, url: str, referer: str = NSE_HEATMAP_URL) -> dict[str, Any]:
         req = request.Request(url, headers=self._headers(referer))
-        with self.opener.open(req, timeout=15) as response:
+        with self._open_with_transient_retry(req, timeout=15) as response:
             payload = response.read()
         return json.loads(payload.decode("utf-8"))
+
+    def _open_with_transient_retry(self, req: request.Request, timeout: int):
+        last_exc: BaseException | None = None
+        for attempt in range(3):
+            try:
+                return self.opener.open(req, timeout=timeout)
+            except OSError as exc:
+                last_exc = exc
+                if not _is_transient_socket_error(exc) or attempt >= 2:
+                    raise
+                time.sleep(0.4 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("NSE request failed before it was attempted")
 
     @staticmethod
     def _headers(referer: str) -> dict[str, str]:
@@ -1495,6 +2426,171 @@ class UpstoxInstrumentResolver:
         return sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
 
 
+class UpstoxOptionInstrumentResolver:
+    def __init__(self, token: str) -> None:
+        self.token = token
+        self.cache_path = UPSTOX_OPTION_INSTRUMENT_CACHE_PATH
+        self.lock = threading.RLock()
+        self.cache = self._load_cache()
+        self.cache.update(self._override_cache())
+        self.last_error: str | None = None
+
+    def resolve(self, contract: dict[str, Any]) -> str | None:
+        cache_key = self._cache_key(contract)
+        symbol_key = str(contract.get("symbol") or "").strip().upper()
+        with self.lock:
+            cached = self.cache.get(cache_key) or self.cache.get(symbol_key)
+            instrument_key = str(cached.get("instrument_key") or "") if isinstance(cached, dict) else ""
+            if instrument_key:
+                return instrument_key
+
+        instrument = self._search_contract(contract)
+        if not instrument:
+            return None
+        instrument_key = str(instrument.get("instrument_key") or instrument.get("instrumentKey") or "")
+        if not instrument_key:
+            self.last_error = f"{cache_key}: option instrument key missing"
+            return None
+        with self.lock:
+            self.cache[cache_key] = {
+                "instrument_key": instrument_key,
+                "trading_symbol": instrument.get("trading_symbol") or instrument.get("tradingSymbol") or contract.get("symbol"),
+                "expiry": contract.get("expiry"),
+                "strike": contract.get("strike"),
+                "optionType": contract.get("optionType"),
+                "resolvedAt": _now_label(),
+            }
+        self._save_cache()
+        self.last_error = None
+        return instrument_key
+
+    def _search_contract(self, contract: dict[str, Any]) -> dict[str, Any] | None:
+        strike = str(contract.get("strike") or "").strip()
+        option_type = str(contract.get("optionType") or "").strip().upper()
+        underlying = str(contract.get("underlying") or contract.get("underlyingSymbol") or "NIFTY").strip().upper()
+        query = f"{underlying} {strike} {option_type}".strip()
+        params = parse.urlencode(
+            {
+                "query": query,
+                "exchanges": "NSE",
+                "segments": "NFO",
+                "instrument_types": "OPTIDX",
+                "page_number": "1",
+                "records": "25",
+            }
+        )
+        req = request.Request(
+            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token}",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+                ),
+            },
+        )
+        try:
+            with request.urlopen(req, timeout=12) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - options page should show the lookup error, not crash polling
+            self.last_error = f"{contract.get('symbol') or query}: {exc}"
+            return None
+
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            self.last_error = f"{contract.get('symbol') or query}: no option search rows"
+            return None
+        match = self._best_match(rows, contract)
+        if match:
+            self.last_error = None
+            return match
+        self.last_error = f"{contract.get('symbol') or query}: no matching NIFTY {option_type} option found"
+        return None
+
+    @staticmethod
+    def _best_match(rows: list[dict[str, Any]], contract: dict[str, Any]) -> dict[str, Any] | None:
+        expiry = str(contract.get("expiry") or "")
+        option_type = str(contract.get("optionType") or "").upper()
+        strike = _to_float(contract.get("strike"))
+        candidates = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_type = str(row.get("option_type") or row.get("optionType") or row.get("instrument_type") or "").upper()
+            row_segment = str(row.get("segment") or "").upper()
+            row_name = str(row.get("name") or row.get("trading_symbol") or row.get("tradingSymbol") or "").upper()
+            underlying = str(contract.get("underlying") or contract.get("underlyingSymbol") or "NIFTY").upper()
+            row_expiry = str(row.get("expiry") or row.get("expiry_date") or row.get("expiryDate") or "")
+            row_strike = _to_float(row.get("strike_price") or row.get("strikePrice") or row.get("strike"))
+            row_underlying = str(row.get("underlying_symbol") or row.get("underlyingSymbol") or "").upper()
+            if underlying not in row_name and underlying not in row_underlying:
+                continue
+            if option_type and option_type not in row_type and not row_name.endswith(option_type):
+                continue
+            if strike is not None and row_strike is not None and abs(row_strike - strike) > 0.01:
+                continue
+            score = 0
+            if row_segment in {"NSE_FO", "NFO"}:
+                score += 2
+            if str(row.get("instrument_key") or "").startswith(("NSE_FO|", "NFO|")):
+                score += 2
+            if expiry and expiry in row_expiry:
+                score += 4
+            candidates.append((score, row))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    def _load_cache(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return {str(key): data for key, data in payload.items() if isinstance(data, dict)}
+
+    def _save_cache(self) -> None:
+        with self.lock:
+            try:
+                self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+                self.cache_path.write_text(json.dumps(self.cache, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                self.last_error = f"Could not save Upstox option instrument cache: {exc}"
+
+    @staticmethod
+    def _override_cache() -> dict[str, dict[str, Any]]:
+        overrides = {}
+        for part in UPSTOX_OPTION_INSTRUMENT_OVERRIDES.replace(",", ";").split(";"):
+            if "=" not in part:
+                continue
+            key, instrument_key = part.split("=", 1)
+            clean_key = key.strip().upper()
+            clean_instrument_key = instrument_key.strip()
+            if clean_key and clean_instrument_key:
+                overrides[clean_key] = {
+                    "instrument_key": clean_instrument_key,
+                    "trading_symbol": clean_key,
+                    "name": "manual option override",
+                    "resolvedAt": _now_label(),
+                }
+        return overrides
+
+    @staticmethod
+    def _cache_key(contract: dict[str, Any]) -> str:
+        return "|".join(
+            [
+                str(contract.get("underlying") or "NIFTY").upper(),
+                str(contract.get("expiry") or ""),
+                str(contract.get("strike") or ""),
+                str(contract.get("optionType") or "").upper(),
+            ]
+        )
+
+
 class UpstoxPriceStreamer:
     def __init__(self, on_prices, app_log: AppLog | None = None) -> None:
         self.on_prices = on_prices
@@ -1503,6 +2599,7 @@ class UpstoxPriceStreamer:
         self.token = UPSTOX_ACCESS_TOKEN
         self.mode = UPSTOX_MARKET_FEED_MODE or "ltpc"
         self.resolver = UpstoxInstrumentResolver(self.token) if self.token else None
+        self.option_resolver = UpstoxOptionInstrumentResolver(self.token) if self.token else None
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -1582,6 +2679,34 @@ class UpstoxPriceStreamer:
             self.last_error = None if found else self.last_error
         self._log("INFO", "Upstox REST prices loaded", requested=len(by_symbol), quoted=found)
         return quoted
+
+    def quote_option(self, contract: dict[str, Any]) -> dict[str, Any]:
+        if not USE_UPSTOX_PRICE_DATA:
+            return {**contract, "quoteError": "Options paper engine requires PRICE_DATA_PROVIDER=upstox."}
+        if not self.token or not self.option_resolver:
+            return {**contract, "quoteError": "Upstox token missing for option quote."}
+        instrument_key = str(contract.get("instrumentKey") or "") or self.option_resolver.resolve(contract)
+        if not instrument_key:
+            return {
+                **contract,
+                "quoteError": self.option_resolver.last_error or "Upstox option instrument was not resolved.",
+            }
+        try:
+            rows = self._fetch_quote_rows([instrument_key])
+        except Exception as exc:  # noqa: BLE001
+            self._log("WARN", "Upstox option quote fetch failed", error=str(exc), symbol=contract.get("symbol"))
+            return {**contract, "instrumentKey": instrument_key, "quoteError": str(exc)}
+        row = rows.get(instrument_key) or next((value for value in rows.values() if isinstance(value, dict)), {})
+        quote = self._option_quote_from_row(row)
+        if quote.get("ltp") is None:
+            return {**contract, "instrumentKey": instrument_key, "quoteError": "Upstox option LTP missing."}
+        return {
+            **contract,
+            **quote,
+            "instrumentKey": instrument_key,
+            "dataSource": "Upstox market-quote/quotes",
+            "priceIsMock": False,
+        }
 
     def update_targets(self, stocks: list[dict[str, Any]]) -> None:
         if not self.enabled:
@@ -1855,12 +2980,29 @@ class UpstoxPriceStreamer:
             f"{UPSTOX_API_BASE_URL}/market-quote/quotes?{params}",
             headers=self._headers(),
         )
-        with request.urlopen(req, timeout=15) as response:
+        with self._urlopen_with_transient_retry(req, timeout=15) as response:
             payload = json.loads(response.read().decode("utf-8"))
         data = payload.get("data") if isinstance(payload, dict) else {}
         return data if isinstance(data, dict) else {}
 
+    @staticmethod
+    def _urlopen_with_transient_retry(req: request.Request, timeout: int):
+        last_exc: BaseException | None = None
+        for attempt in range(3):
+            try:
+                return request.urlopen(req, timeout=timeout)
+            except OSError as exc:
+                last_exc = exc
+                if not _is_transient_socket_error(exc) or attempt >= 2:
+                    raise
+                time.sleep(0.4 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Upstox request failed before it was attempted")
+
     def _headers(self) -> dict[str, str]:
+        # Include the configured access token in the Authorization header so
+        # Upstox REST endpoints can be queried.
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -1901,6 +3043,40 @@ class UpstoxPriceStreamer:
             "priceIsMock": False,
         }
 
+    @staticmethod
+    def _option_quote_from_row(row: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(row, dict):
+            return {}
+        depth = row.get("depth") if isinstance(row.get("depth"), dict) else {}
+        buy_depth = depth.get("buy") if isinstance(depth.get("buy"), list) else []
+        sell_depth = depth.get("sell") if isinstance(depth.get("sell"), list) else []
+        best_bid = buy_depth[0] if buy_depth and isinstance(buy_depth[0], dict) else {}
+        best_ask = sell_depth[0] if sell_depth and isinstance(sell_depth[0], dict) else {}
+        bid = _first_float(row.get("bid_price"), row.get("bidPrice"), best_bid.get("price"))
+        ask = _first_float(row.get("ask_price"), row.get("askPrice"), best_ask.get("price"))
+        ltp = _first_float(row.get("last_price"), row.get("ltp"), row.get("lastPrice"))
+        previous_close = _first_float(row.get("prev_close"), row.get("previous_close"), row.get("previousClose"), row.get("close"))
+        change = _first_float(row.get("net_change"), row.get("netChange"), row.get("change"))
+        if change is None and ltp is not None and previous_close:
+            change = ltp - previous_close
+        percent_change = _first_float(row.get("pchange"), row.get("pChange"), row.get("percent_change"), row.get("percentChange"))
+        if percent_change is None and change is not None and previous_close:
+            percent_change = (change / previous_close) * 100
+        spread_pct = ((ask - bid) / ltp) * 100 if bid and ask and ltp else None
+        oi = _first_float(row.get("oi"), row.get("open_interest"), row.get("openInterest"))
+        return {
+            "ltp": ltp,
+            "change": change,
+            "percentChange": percent_change,
+            "previousClose": previous_close,
+            "bid": _round_price(bid),
+            "ask": _round_price(ask),
+            "spreadPct": round(spread_pct, 2) if spread_pct is not None else None,
+            "volume": _first_float(row.get("volume"), row.get("last_traded_quantity"), row.get("lastTradedQuantity")),
+            "oi": oi,
+            "iv": _first_float(row.get("iv"), row.get("implied_volatility"), row.get("impliedVolatility")),
+        }
+
     def _log(self, level: str, message: str, **fields: Any) -> None:
         if not self.app_log:
             return
@@ -1927,9 +3103,12 @@ class FeedState:
     sector_rows: list[dict[str, Any]] = field(default_factory=list)
     sector_stock_groups: list[dict[str, Any]] = field(default_factory=list)
     paper_trading: dict[str, Any] = field(default_factory=dict)
+    options_paper_trading: dict[str, Any] = field(default_factory=dict)
     price_streaming: dict[str, Any] = field(default_factory=dict)
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
+    nifty_spot: dict[str, Any] | None = None
+    index_spots: dict[str, dict[str, Any]] = field(default_factory=dict)
     market_status: dict[str, Any] = field(default_factory=dict)
     market_clock: dict[str, Any] = field(default_factory=dict)
     data_provenance: dict[str, Any] = field(default_factory=dict)
@@ -1942,6 +3121,7 @@ class NSEStreamer:
         self.app_log = AppLog()
         self.client = NSEClient()
         self.paper_engine = PaperTradingEngine()
+        self.options_engine = NiftyOptionsPaperEngine()
         self.price_streamer = UpstoxPriceStreamer(self._handle_stream_prices, self.app_log)
         self.state = FeedState()
         self.lock = threading.RLock()
@@ -2008,6 +3188,15 @@ class NSEStreamer:
         self._refresh_price_stream_targets()
         return {**result, "status": status}
 
+    def close_options_trade(self, trade_id: str) -> dict[str, Any]:
+        with self.paper_lock:
+            result = self.options_engine.close_trade_by_id(trade_id, self.price_streamer.quote_option)
+            options_paper = self.options_engine.snapshot()
+        with self.lock:
+            self.state.options_paper_trading = options_paper
+            status = self.status()
+        return {**result, "status": status}
+
     def paper_report(self, date_key: str | None = None) -> dict[str, Any]:
         with self.paper_lock:
             return self.paper_engine.daily_report(date_key)
@@ -2017,9 +3206,11 @@ class NSEStreamer:
             return
         with self.paper_lock:
             paper_trading = self.paper_engine.mark_stream_prices(ticks)
+            options_paper = self.options_engine.snapshot()
         with self.lock:
             self._overlay_stream_prices_locked(ticks)
             self.state.paper_trading = paper_trading
+            self.state.options_paper_trading = options_paper
             self.state.price_streaming = self.price_streamer.status()
         self._refresh_price_stream_targets()
 
@@ -2174,6 +3365,12 @@ class NSEStreamer:
                     market_open=bool(market_clock.get("shouldStream")),
                     mark_stocks=active_quote_stocks,
                 )
+                options_paper = self.options_engine.update(
+                    parsed["sector_rows"],
+                    parsed["index_spots"],
+                    self.price_streamer.quote_option,
+                    market_open=bool(market_clock.get("shouldStream")),
+                )
             with self.lock:
                 self.state.last_error = None
                 self.state.last_success_at = _now_label()
@@ -2181,8 +3378,11 @@ class NSEStreamer:
                 self.state.sector_rows = parsed["sector_rows"]
                 self.state.sector_stock_groups = stock_groups
                 self.state.paper_trading = paper_trading
+                self.state.options_paper_trading = options_paper
                 self.state.max_gainer = parsed["max_gainer"]
                 self.state.max_loser = parsed["max_loser"]
+                self.state.nifty_spot = parsed["nifty_spot"]
+                self.state.index_spots = parsed["index_spots"]
                 self.state.market_status = self.market_status_cache or parsed["market_status"]
                 self.state.market_clock = market_clock
                 self.state.data_provenance = self._data_provenance()
@@ -2205,11 +3405,13 @@ class NSEStreamer:
     def _set_market_clock(self, clock: dict[str, Any]) -> None:
         with self.paper_lock:
             paper_trading = self.paper_engine.snapshot()
+            options_paper = self.options_engine.snapshot()
         with self.lock:
             self.state.market_clock = clock
             self.state.market_status = self.market_status_cache
             self.state.data_provenance = self._data_provenance()
             self.state.paper_trading = paper_trading
+            self.state.options_paper_trading = options_paper
             self.state.price_streaming = self.price_streamer.status()
 
     def _market_clock(self, force: bool = False) -> dict[str, Any]:
@@ -2494,6 +3696,21 @@ class NSEStreamer:
         sector_rows = [_sector_row(item) for item in rows if isinstance(item, dict) and _is_sector_index(item)]
         sector_rows = [row for row in sector_rows if row["percentChange"] is not None]
         sector_rows.sort(key=lambda row: row["percentChange"], reverse=True)
+        index_lookup = {
+            str(config.get("symbol") or "").upper(): str(config.get("nseSymbol") or "").upper()
+            for config in NIFTY_OPTIONS_INDEXES
+        }
+        index_spots = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            clean_symbol = _clean_index_symbol(str(item.get("indexSymbol") or item.get("index") or "")).upper()
+            for derivative_symbol, nse_symbol in index_lookup.items():
+                if clean_symbol == nse_symbol:
+                    index_spots[derivative_symbol] = _index_row(item, nse_symbol)
+                    index_spots[nse_symbol] = index_spots[derivative_symbol]
+                    break
+        nifty_item = index_spots.get("NIFTY")
         max_gainer = sector_rows[0] if sector_rows else None
         max_loser = sector_rows[-1] if sector_rows else None
         market_status = payload.get("marketStatus") or payload.get("marketState") or {}
@@ -2506,6 +3723,8 @@ class NSEStreamer:
             "sector_rows": sector_rows,
             "max_gainer": max_gainer,
             "max_loser": max_loser,
+            "nifty_spot": nifty_item,
+            "index_spots": index_spots,
             "market_status": market_status,
             "snapshot_time": snapshot_time,
             "raw_count": len(rows),
@@ -2561,6 +3780,10 @@ class AppHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             result = streamer.close_paper_trade(str(payload.get("trade_id") or payload.get("id") or ""))
             self._json(result, 200 if result.get("ok") else 400)
+        elif self.path == "/api/options-trades/close":
+            payload = self._read_json()
+            result = streamer.close_options_trade(str(payload.get("trade_id") or payload.get("id") or ""))
+            self._json(result, 200 if result.get("ok") else 400)
         else:
             self._not_found()
 
@@ -2602,8 +3825,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)
-        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, socket.timeout):
-            return
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, socket.timeout, OSError) as exc:
+            if _is_transient_socket_error(exc):
+                return
+            raise
 
     def _not_found(self) -> None:
         self._json({"error": "not found"}, 404)

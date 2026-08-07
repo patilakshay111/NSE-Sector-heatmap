@@ -34,11 +34,13 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 DATA_ROOT = ROOT / "data"
 RUN_ROOT = ROOT / ".run"
 PAPER_STATE_PATH = DATA_ROOT / "paper_trading_state.json"
+OPTIONS_PAPER_STATE_PATH = DATA_ROOT / "options_paper_trading_state.json"
 UPSTOX_INSTRUMENT_CACHE_PATH = DATA_ROOT / "upstox_instrument_cache.json"
+UPSTOX_OPTION_INSTRUMENT_CACHE_PATH = DATA_ROOT / "upstox_option_instrument_cache.json"
 UPSTOX_TOKEN_FILE = Path(os.getenv("UPSTOX_TOKEN_FILE", str(RUN_ROOT / "upstox-token.json")))
 
 DASHBOARD_HOST = "127.0.0.1"
-DASHBOARD_PORT = 8775
+DASHBOARD_PORT = 8774
 DASHBOARD_URL = f"http://{DASHBOARD_HOST}:{DASHBOARD_PORT}"
 
 NSE_HOME = "https://www.nseindia.com"
@@ -81,6 +83,7 @@ UPSTOX_ACCESS_TOKEN = (
 )
 UPSTOX_API_BASE_URL = os.getenv("UPSTOX_API_BASE_URL", "https://api.upstox.com/v2").strip().rstrip("/")
 UPSTOX_INSTRUMENT_OVERRIDES = os.getenv("UPSTOX_INSTRUMENT_OVERRIDES", "").strip()
+UPSTOX_OPTION_INSTRUMENT_OVERRIDES = os.getenv("UPSTOX_OPTION_INSTRUMENT_OVERRIDES", "").strip()
 UPSTOX_MARKET_FEED_MODE = os.getenv("UPSTOX_MARKET_FEED_MODE", "ltpc").strip().lower()
 UPSTOX_RECONNECT_SECONDS = int(os.getenv("UPSTOX_RECONNECT_SECONDS", "30") or "30")
 MARKET_OPEN_TIME = dt.time(9, 0)
@@ -88,8 +91,8 @@ MARKET_CLOSE_TIME = dt.time(15, 31)
 
 SECTOR_PICK_COUNT = 2
 STOCKS_PER_SECTOR = 5
-BUY_SECTOR_THRESHOLD = 0.9
-SELL_SECTOR_THRESHOLD = -0.9
+BUY_SECTOR_THRESHOLD = 0.5
+SELL_SECTOR_THRESHOLD = -0.5
 
 PAPER_INITIAL_CAPITAL = 1_000_000.0
 PAPER_TRADE_ALLOCATION = 50_000.0
@@ -113,6 +116,115 @@ MIN_TRADE_RR = 1.5
 PAPER_MOVE_SL_TO_BE = False
 PAPER_BE_TRIGGER_RR = 2.0
 PAPER_BE_LOCK_RR = 0.20
+
+# Editable defaults (change these values directly in config.py):
+# - PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT
+#     When True, confirmations are considered valid from the candle start
+#     (allows acting on a still-forming M5 candle). When False, confirmations
+#     are only valid after the candle completes.
+# - PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT
+#     When True, the same M5 confirmation may trigger multiple trades (old behaviour).
+#     When False, each confirmation is marked used and won't trigger new trades.
+PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT = True
+PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT = True
+
+# Environment-aware parsing helper. If you prefer env vars, set the literal
+# strings 'true' or 'false' (case-insensitive). If unset or invalid, the
+# defaults above are used.
+def _env_bool_strict(key: str, default: bool = False) -> bool:
+    """Parse an env var that must be the literal string 'true' or 'false'.
+
+    Any other value (including '1' or '0') falls back to the provided default.
+    """
+    val = os.getenv(key)
+    if val is None:
+        return default
+    s = str(val).strip().lower()
+    if s == "true":
+        return True
+    if s == "false":
+        return False
+    return default
+
+# Final effective toggles (editable via the DEFAULT constants above or
+# overridden at runtime with env vars PAPER_ALLOW_INFLIGHT_CONFIRMATIONS and
+# PAPER_ALLOW_CONFIRMATION_REUSE set to 'true' or 'false').
+PAPER_ALLOW_INFLIGHT_CONFIRMATIONS = _env_bool_strict(
+    "PAPER_ALLOW_INFLIGHT_CONFIRMATIONS", PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT
+)
+
+# Allow re-using the same M5 confirmation for multiple trades (old behaviour).
+PAPER_ALLOW_CONFIRMATION_REUSE = _env_bool_strict(
+    "PAPER_ALLOW_CONFIRMATION_REUSE", PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT
+)
+
+NIFTY_OPTIONS_INITIAL_CAPITAL = 500_000.0
+NIFTY_OPTIONS_TRADE_ALLOCATION = float(os.getenv("NIFTY_OPTIONS_TRADE_ALLOCATION", "50000") or "50000")
+NIFTY_OPTIONS_LOT_SIZE = int(os.getenv("NIFTY_OPTIONS_LOT_SIZE", "75") or "75")
+NIFTY_OPTIONS_STRIKE_INTERVAL = int(os.getenv("NIFTY_OPTIONS_STRIKE_INTERVAL", "50") or "50")
+NIFTY_OPTIONS_STRIKE_OFFSET_STEPS = int(os.getenv("NIFTY_OPTIONS_STRIKE_OFFSET_STEPS", "0") or "0")
+NIFTY_OPTIONS_EXPIRY_WEEKDAY = int(os.getenv("NIFTY_OPTIONS_EXPIRY_WEEKDAY", "1") or "1")
+NIFTY_OPTIONS_EXPIRY_SKIP_HOUR = int(os.getenv("NIFTY_OPTIONS_EXPIRY_SKIP_HOUR", "12") or "12")
+NIFTY_OPTIONS_EXPIRY_SKIP_MINUTE = int(os.getenv("NIFTY_OPTIONS_EXPIRY_SKIP_MINUTE", "0") or "0")
+NIFTY_OPTIONS_MIN_SECTOR_RATIO = float(os.getenv("NIFTY_OPTIONS_MIN_SECTOR_RATIO", "0.60") or "0.60")
+NIFTY_OPTIONS_MIN_BREADTH = float(os.getenv("NIFTY_OPTIONS_MIN_BREADTH", "0.20") or "0.20")
+NIFTY_OPTIONS_BREAKOUT_BUFFER = float(os.getenv("NIFTY_OPTIONS_BREAKOUT_BUFFER", "0.0005") or "0.0005")
+NIFTY_OPTIONS_PREMIUM_SL_PCT = float(os.getenv("NIFTY_OPTIONS_PREMIUM_SL_PCT", "0.25") or "0.25")
+NIFTY_OPTIONS_PREMIUM_TARGET_PCT = float(os.getenv("NIFTY_OPTIONS_PREMIUM_TARGET_PCT", "0.50") or "0.50")
+NIFTY_OPTIONS_MIN_PREMIUM = float(os.getenv("NIFTY_OPTIONS_MIN_PREMIUM", "20") or "20")
+NIFTY_OPTIONS_MAX_PREMIUM = float(os.getenv("NIFTY_OPTIONS_MAX_PREMIUM", "300") or "300")
+NIFTY_OPTIONS_MAX_SPREAD_PCT = float(os.getenv("NIFTY_OPTIONS_MAX_SPREAD_PCT", "0.08") or "0.08")
+NIFTY_OPTIONS_MIN_VOLUME = int(os.getenv("NIFTY_OPTIONS_MIN_VOLUME", "1000") or "1000")
+NIFTY_OPTIONS_MIN_OI = int(os.getenv("NIFTY_OPTIONS_MIN_OI", "1000") or "1000")
+NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH = int(os.getenv("NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH", "1") or "1")
+NIFTY_OPTIONS_IDEA_RETENTION_SECONDS = int(os.getenv("NIFTY_OPTIONS_IDEA_RETENTION_SECONDS", "900") or "900")
+NIFTY_OPTIONS_INDEXES = (
+    {
+        "symbol": "NIFTY",
+        "name": "NIFTY 50",
+        "nseSymbol": "NIFTY 50",
+        "lotSize": 65,
+        "strikeInterval": 50,
+        "sectorSymbols": (),
+        "enabled": True,
+    },
+    {
+        "symbol": "BANKNIFTY",
+        "name": "NIFTY BANK",
+        "nseSymbol": "NIFTY BANK",
+        "lotSize": 30,
+        "strikeInterval": 100,
+        "sectorSymbols": ("NIFTY BANK", "NIFTY PVT BANK", "NIFTY PSU BANK"),
+        "enabled": True,
+    },
+    {
+        "symbol": "FINNIFTY",
+        "name": "NIFTY FIN SERVICE",
+        "nseSymbol": "NIFTY FIN SERVICE",
+        "lotSize": 60,
+        "strikeInterval": 50,
+        "sectorSymbols": ("NIFTY FIN SERVICE", "NIFTY FINSRV25 50", "NIFTY FINSEREXBNK", "NIFTY MS FIN SERV"),
+        "enabled": True,
+    },
+    {
+        "symbol": "MIDCPNIFTY",
+        "name": "NIFTY MIDCAP SELECT",
+        "nseSymbol": "NIFTY MID SELECT",
+        "lotSize": 120,
+        "strikeInterval": 25,
+        "sectorSymbols": ("NIFTY MID SELECT", "NIFTY MIDSML HLTH", "NIFTY MS FIN SERV", "NIFTY MS IT TELCM"),
+        "enabled": True,
+    },
+    {
+        "symbol": "NIFTYNXT50",
+        "name": "NIFTY NEXT 50",
+        "nseSymbol": "NIFTY NEXT 50",
+        "lotSize": 25,
+        "strikeInterval": 100,
+        "sectorSymbols": ("NIFTY NEXT 50",),
+        "enabled": True,
+    },
+)
 
 SECTOR_KEYWORDS = {
     "AUTO",

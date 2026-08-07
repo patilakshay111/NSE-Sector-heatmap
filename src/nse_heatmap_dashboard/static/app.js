@@ -44,6 +44,15 @@ function pct(value) {
   return `${n >= 0 ? "+" : ""}${fmt(n, 2)}%`;
 }
 
+function hasNumber(value) {
+  if (value === null || value === undefined || value === "" || value === "-") return false;
+  return Number.isFinite(Number(value));
+}
+
+function fmtMaybe(value, digits = 2) {
+  return hasNumber(value) ? fmt(value, digits) : "-";
+}
+
 function safe(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -58,6 +67,30 @@ function changeClass(value) {
   if (n > 0) return "good";
   if (n < 0) return "bad";
   return "warn";
+}
+
+function optionIdeaTitle(idea) {
+  return idea.symbol && idea.symbol !== "-" ? idea.symbol : (idea.underlyingSymbol || idea.underlying || "-");
+}
+
+function optionIdeaMeta(idea) {
+  if (!idea.symbol || idea.symbol === "-") {
+    return idea.underlying && idea.underlying !== idea.underlyingSymbol ? idea.underlying : "";
+  }
+  return `${idea.expiry || "-"} / ${idea.optionType || "-"} ${fmtMaybe(idea.strike, 0)}`;
+}
+
+function compactIdeaStatus(idea) {
+  let status = String(idea.originalStatus || idea.status || "-");
+  const marker = "Last signal:";
+  while (status.includes(marker)) {
+    status = status.split(marker).pop().trim();
+  }
+  const parts = [];
+  if (idea.stale) parts.push("Stale");
+  parts.push(status || "-");
+  if (hasNumber(idea.score)) parts.push(`score ${fmt(idea.score, 2)}`);
+  return parts.join(" / ");
 }
 
 function heatColor(value) {
@@ -138,6 +171,35 @@ function renderHeatmap(rows) {
       <span>Adv ${row.advances || 0} / Dec ${row.declines || 0}</span>
     </article>
   `).join("");
+}
+
+function renderIndexPriceTiles(status) {
+  const target = q("#index-price-tiles");
+  if (!target) return;
+  const spots = status.index_spots || {};
+  const indexConfigs = status.options_paper_trading?.strategy?.indexes || [
+    { symbol: "NIFTY", name: "NIFTY 50" },
+    { symbol: "BANKNIFTY", name: "NIFTY BANK" },
+    { symbol: "FINNIFTY", name: "NIFTY FIN SERVICE" },
+    { symbol: "MIDCPNIFTY", name: "NIFTY MIDCAP SELECT" },
+    { symbol: "NIFTYNXT50", name: "NIFTY NEXT 50" },
+  ];
+  const tiles = indexConfigs.map((config) => {
+    const symbol = String(config.symbol || "");
+    const name = String(config.name || symbol);
+    const spot = spots[symbol] || spots[name.toUpperCase()] || Object.values(spots).find((row) => (
+      String(row?.symbol || "").toUpperCase() === name.toUpperCase()
+    ));
+    return { symbol, name, spot };
+  });
+  target.innerHTML = tiles.length ? tiles.map((tile) => `
+    <article class="index-price-tile">
+      <span>${safe(tile.symbol)}</span>
+      <strong>${fmt(tile.spot?.last)}</strong>
+      <div class="${changeClass(tile.spot?.percentChange)}">${pct(tile.spot?.percentChange)}</div>
+      <small>${safe(tile.name)}</small>
+    </article>
+  `).join("") : "<div class=\"empty-state\">Waiting for index prices.</div>";
 }
 
 function renderTable(rows) {
@@ -403,6 +465,132 @@ function renderPaperTrading(paper) {
   `).join("") : "<tr><td colspan=\"10\" class=\"empty-state\">No closed paper trades yet.</td></tr>";
 }
 
+function renderOptionsPriceTiles(options) {
+  const target = q("#options-price-tiles");
+  if (!target) return;
+  const tiles = options?.optionTiles || [];
+  if (!tiles.length) {
+    target.innerHTML = "<div class=\"empty-state\">Option price tiles load during the options paper session.</div>";
+    return;
+  }
+  target.innerHTML = tiles.map((tile) => {
+    const contracts = tile.contracts || [];
+    const rows = contracts.length ? contracts.map((contract) => `
+      <div class="option-contract ${contract.optionType === "CE" ? "call" : "put"}">
+        <div>
+          <strong>${safe(contract.optionType || "-")}</strong>
+          <span>${fmt(contract.strike, 0)} / ${safe(contract.expiry || "-")}</span>
+        </div>
+        <div>
+          <strong>${fmt(contract.ltp)}</strong>
+          <span class="${changeClass(contract.percentChange)}">${pct(contract.percentChange)}</span>
+        </div>
+      </div>
+    `).join("") : `<div class="empty-state">${safe(tile.status || "Waiting for Upstox option quote.")}</div>`;
+    return `
+      <article class="option-price-tile">
+        <div class="option-tile-head">
+          <div>
+            <strong>${safe(tile.underlyingSymbol || tile.underlying || "-")}</strong>
+            <span>${safe(tile.underlying || "-")}</span>
+          </div>
+          <div>
+            <strong>${fmt(tile.spot)}</strong>
+            <span>Spot</span>
+          </div>
+        </div>
+        <div class="option-contracts">${rows}</div>
+      </article>
+    `;
+  }).join("");
+}
+
+function renderOptionsPaper(options) {
+  const data = options || {};
+  const ideas = data.ideas || (data.idea ? [data.idea] : []);
+  const activeTrades = data.openTrades || data.activeTrades || [];
+  const closedTrades = data.closedTrades || [];
+
+  q("#op-initial").textContent = fmt(data.initialCapital, 0);
+  q("#op-available").textContent = fmt(data.availableCapital, 0);
+  q("#op-allocated").textContent = fmt(data.allocatedCapital, 0);
+  q("#op-unrealized").textContent = fmt(data.unrealizedPnl);
+  q("#op-unrealized").className = changeClass(data.unrealizedPnl);
+  q("#op-realized").textContent = fmt(data.realizedPnl);
+  q("#op-realized").className = changeClass(data.realizedPnl);
+  q("#op-active-count").textContent = data.activeCount ?? "-";
+  q("#op-total-trades").textContent = data.totalTrades ?? "-";
+  q("#op-win-rate").textContent = Number.isFinite(Number(data.winRate)) ? pct(data.winRate) : "-";
+  q("#op-profit-factor").textContent = data.profitFactorLabel || "-";
+  q("#op-saved").textContent = data.persistenceError ? "Save error" : data.lastSavedAt || "-";
+  q("#op-saved").className = data.persistenceError ? "bad" : "";
+  q("#op-idea-status").textContent = data.sessionOpen ? "Live signal" : data.sessionStatus || "Waiting for session";
+  q("#op-closed-count").textContent = `${data.closedCount || 0} closed`;
+
+  q("#options-idea-body").innerHTML = data.persistenceError
+    ? `<tr><td colspan="10" class="empty-state bad">${safe(data.persistenceError)}</td></tr>`
+    : ideas.length ? ideas.map((idea) => `
+      <tr class="${idea.ready ? "ready-row" : idea.stale ? "stale-row" : ""}">
+        <td class="idea-contract-cell">
+          <strong>${safe(optionIdeaTitle(idea))}</strong>
+          <span>${safe(optionIdeaMeta(idea))}</span>
+        </td>
+        <td class="${idea.direction === "BULLISH" ? "good" : idea.direction === "BEARISH" ? "bad" : "warn"}">${safe(idea.direction || "-")}</td>
+        <td>
+          ${fmtMaybe(idea.spot)}
+          <span>O ${fmtMaybe(idea.spotOpen)} / M5 ${fmtMaybe(idea.m5?.low)}-${fmtMaybe(idea.m5?.high)}</span>
+        </td>
+        <td>${fmtMaybe(idea.entry)}</td>
+        <td>${fmtMaybe(idea.stopLoss)}</td>
+        <td>${fmtMaybe(idea.target)}</td>
+        <td>${fmtMaybe(idea.lots, 0)} <span>${fmtMaybe(idea.quantity, 0)} qty</span></td>
+        <td>${fmtMaybe(idea.spreadPct)}%</td>
+        <td>${fmtMaybe(idea.volume, 0)} / ${fmtMaybe(idea.oi, 0)}</td>
+        <td class="idea-status-cell"><span class="status-pill ${idea.ready ? "ready" : idea.stale ? "stale" : ""}">${safe(compactIdeaStatus(idea))}</span></td>
+      </tr>
+    `).join("")
+    : "<tr><td colspan=\"10\" class=\"empty-state\">Waiting for heatmap and index option setups.</td></tr>";
+
+  q("#options-active-body").innerHTML = activeTrades.length ? activeTrades.map((trade) => `
+    <tr>
+      <td>
+        <strong>${safe(trade.id)}</strong>
+        <span>${safe(trade.direction || "-")}</span>
+      </td>
+      <td>
+        ${safe(trade.symbol)}
+        <span>${safe(trade.underlyingSymbol || trade.underlying || "-")} / ${safe(trade.instrumentKey || "-")}</span>
+      </td>
+      <td>${safe(trade.entryTime || trade.openedAt)}</td>
+      <td>${fmt(trade.entry)}</td>
+      <td>${fmt(trade.currentPrice)}</td>
+      <td>${fmt(trade.stopLoss)}</td>
+      <td>${fmt(trade.target)}</td>
+      <td>${fmt(trade.quantity, 0)}</td>
+      <td class="${changeClass(trade.unrealizedPnl)}">${fmt(trade.unrealizedPnl)}</td>
+      <td>
+        ${fmt(trade.spreadPct)}%
+        <span>${fmt(trade.volume, 0)} / ${fmt(trade.oi, 0)}</span>
+      </td>
+      <td><button class="close-options-trade-btn danger" type="button" data-trade-id="${safe(trade.id)}">Close</button></td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"11\" class=\"empty-state\">No active options paper trades yet.</td></tr>";
+
+  q("#options-closed-body").innerHTML = closedTrades.length ? closedTrades.map((trade) => `
+    <tr>
+      <td>${safe(trade.id)}</td>
+      <td>${safe(trade.symbol)}</td>
+      <td>${safe(trade.exitReason)}</td>
+      <td>${fmt(trade.quantity, 0)}</td>
+      <td>${safe(trade.entryTime || trade.openedAt)}</td>
+      <td>${safe(trade.exitTime || trade.closedAt)}</td>
+      <td>${fmt(trade.entry)}</td>
+      <td>${fmt(trade.exitPrice)}</td>
+      <td class="${changeClass(trade.realizedPnl)}">${fmt(trade.realizedPnl)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"9\" class=\"empty-state\">No closed options paper trades yet.</td></tr>";
+}
+
 function renderPaperTradesIndex(paper) {
   const data = paper || {};
   const allTrades = [...(data.allTrades || [])].sort((left, right) => (
@@ -556,6 +744,7 @@ function renderSettings(status) {
   q("#mock-prices").textContent = provenance.mockPricesAllowed ? "Allowed" : "Blocked";
   q("#mock-prices").className = provenance.mockPricesAllowed ? "bad" : "good";
   q("#paper-data-policy").textContent = status.paper_trading?.dataPolicy?.lookAheadBiasGuard || provenance.paperLogic || "-";
+  q("#options-data-policy").textContent = status.options_paper_trading?.dataPolicy?.priceSource || "-";
   const stopConfig = status.paper_trading?.stopManagement || {};
   q("#paper-be-enabled").textContent = stopConfig.moveSlToBreakEven ? "On" : "Off";
   q("#paper-be-enabled").className = stopConfig.moveSlToBreakEven ? "good" : "warn";
@@ -618,10 +807,13 @@ function renderStatus(status) {
   renderLeaders(status);
   renderMomentum(rows);
   renderHeatmap(rows);
+  renderIndexPriceTiles(status);
   renderTable(rows);
   renderSectorSelectionRule(status.sector_selection_rule);
   renderStockGroups(status.sector_stock_groups || []);
   renderPaperTrading(status.paper_trading || {});
+  renderOptionsPaper(status.options_paper_trading || {});
+  renderOptionsPriceTiles(status.options_paper_trading || {});
   renderPaperTradesIndex(status.paper_trading || {});
   renderLogs(status.logs || []);
   const liveReport = status.paper_trading?.dailyReport || {};
@@ -643,6 +835,15 @@ async function command(path) {
 
 async function closePaperTrade(tradeId) {
   const result = await api("/api/paper-trades/close", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trade_id: tradeId }),
+  });
+  renderStatus(result.status);
+}
+
+async function closeOptionsTrade(tradeId) {
+  const result = await api("/api/options-trades/close", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ trade_id: tradeId }),
@@ -703,14 +904,17 @@ q("#paper-trades-date").addEventListener("change", (event) => {
 
 document.addEventListener("click", (event) => {
   const button = event.target?.closest?.(".close-trade-btn");
-  if (!button) return;
-  const tradeId = button.dataset.tradeId;
-  button.disabled = true;
-  button.textContent = "Closing...";
-  closePaperTrade(tradeId).catch((err) => {
+  const optionsButton = event.target?.closest?.(".close-options-trade-btn");
+  if (!button && !optionsButton) return;
+  const activeButton = button || optionsButton;
+  const tradeId = activeButton.dataset.tradeId;
+  activeButton.disabled = true;
+  activeButton.textContent = "Closing...";
+  const closeAction = optionsButton ? closeOptionsTrade : closePaperTrade;
+  closeAction(tradeId).catch((err) => {
     q("#status-line").textContent = err.message;
-    button.disabled = false;
-    button.textContent = "Close";
+    activeButton.disabled = false;
+    activeButton.textContent = "Close";
   });
 });
 

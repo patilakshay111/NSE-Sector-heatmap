@@ -230,7 +230,8 @@ button.danger {
   margin-bottom: 14px;
 }
 
-.close-trade-btn {
+.close-trade-btn,
+.close-options-trade-btn {
   min-height: 30px;
   padding: 6px 10px;
 }
@@ -360,6 +361,111 @@ button.danger {
   min-width: 2px;
 }
 
+.index-price-tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(150px, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+
+.index-price-tile {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.index-price-tile span,
+.index-price-tile small {
+  display: block;
+  color: var(--muted);
+}
+
+.index-price-tile span {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.index-price-tile strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 22px;
+  overflow-wrap: anywhere;
+}
+
+.index-price-tile div {
+  margin-top: 4px;
+  font-weight: 700;
+}
+
+.index-price-tile small {
+  margin-top: 6px;
+  font-size: 11px;
+}
+
+.options-price-tiles {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(180px, 1fr));
+  gap: 10px;
+  padding: 14px;
+}
+
+.option-price-tile {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--panel);
+}
+
+.option-tile-head,
+.option-contract {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.option-tile-head {
+  align-items: flex-start;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--subtle-line);
+}
+
+.option-tile-head strong,
+.option-contract strong {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.option-tile-head span,
+.option-contract span {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.option-contracts {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.option-contract {
+  align-items: center;
+  border-left: 4px solid var(--line);
+  padding-left: 8px;
+}
+
+.option-contract.call {
+  border-left-color: var(--heat-good);
+}
+
+.option-contract.put {
+  border-left-color: var(--heat-bad);
+}
+
 .sector-heatmap {
   display: grid;
   grid-template-columns: repeat(4, minmax(170px, 1fr));
@@ -473,6 +579,10 @@ button.danger {
   background: color-mix(in srgb, var(--heat-good), var(--panel) 92%);
 }
 
+.stale-row {
+  background: color-mix(in srgb, var(--warn), var(--panel) 94%);
+}
+
 .status-pill {
   display: inline-block;
   max-width: 260px;
@@ -480,13 +590,48 @@ button.danger {
   border: 1px solid var(--line);
   border-radius: 6px;
   color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
   white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .status-pill.ready {
   border-color: var(--heat-good);
   color: var(--good);
   font-weight: 700;
+}
+
+.status-pill.stale {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+.idea-contract-cell {
+  min-width: 150px;
+  max-width: 230px;
+  white-space: normal;
+}
+
+.idea-contract-cell strong,
+.idea-contract-cell span {
+  overflow-wrap: anywhere;
+}
+
+.idea-status-cell {
+  min-width: 220px;
+  max-width: 380px;
+  white-space: normal;
+}
+
+.idea-status-cell .status-pill {
+  max-width: 100%;
+}
+
+#options-idea-body td {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  vertical-align: top;
 }
 
 .log-details {
@@ -559,6 +704,8 @@ th {
   .metric-grid,
   .stock-summary,
   .paper-summary,
+  .index-price-tiles,
+  .options-price-tiles,
   .sector-heatmap {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -580,12 +727,14 @@ th {
 
   .metric-grid,
   .leader-grid,
-  .stock-summary,
-  .paper-summary,
-  .report-grid,
-  .sector-heatmap {
-    grid-template-columns: 1fr;
-  }
+    .stock-summary,
+    .paper-summary,
+    .report-grid,
+    .index-price-tiles,
+    .options-price-tiles,
+    .sector-heatmap {
+      grid-template-columns: 1fr;
+    }
 
   .momentum-row {
     grid-template-columns: 1fr;

@@ -30,6 +30,7 @@
       <button class="nav" data-view="heatmap">Sector Heatmap</button>
       <button class="nav" data-view="indices">All Sectors</button>
       <button class="nav" data-view="sector-stocks">Sector Stocks</button>
+      <button class="nav" data-view="options-paper">Index Options</button>
       <button class="nav" data-view="paper-dashboard">Paper Dashboard</button>
       <button class="nav" data-view="paper-trades">Paper Trades</button>
       <button class="nav" data-view="paper-pnl">Paper PnL</button>
@@ -81,9 +82,25 @@
 
       <div class="panel dashboard-panel">
         <div class="panel-head">
+          <h2>Index Prices</h2>
+          <span>NIFTY family</span>
+        </div>
+        <div id="index-price-tiles" class="index-price-tiles"></div>
+      </div>
+
+      <div class="panel dashboard-panel">
+        <div class="panel-head">
           <h2>Sector Momentum</h2>
         </div>
         <div id="momentum-list" class="momentum-list"></div>
+      </div>
+
+      <div class="panel dashboard-panel">
+        <div class="panel-head">
+          <h2>Index Options Prices</h2>
+          <span>ATM CE/PE from Upstox</span>
+        </div>
+        <div id="options-price-tiles" class="options-price-tiles"></div>
       </div>
     </section>
 
@@ -183,6 +200,72 @@
               </tr>
             </thead>
             <tbody id="closed-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="options-paper" class="view">
+      <div class="paper-summary">
+        <article class="metric"><span>Options Capital</span><strong id="op-initial">-</strong></article>
+        <article class="metric"><span>Available</span><strong id="op-available">-</strong></article>
+        <article class="metric"><span>Allocated</span><strong id="op-allocated">-</strong></article>
+        <article class="metric"><span>Unrealized P/L</span><strong id="op-unrealized">-</strong></article>
+        <article class="metric"><span>Realized P/L</span><strong id="op-realized">-</strong></article>
+        <article class="metric"><span>Active</span><strong id="op-active-count">-</strong></article>
+        <article class="metric"><span>Total Trades</span><strong id="op-total-trades">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="op-win-rate">-</strong></article>
+        <article class="metric"><span>PF</span><strong id="op-profit-factor">-</strong></article>
+        <article class="metric"><span>Last Saved</span><strong id="op-saved">-</strong></article>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Index Options Ideas</h2>
+          <span id="op-idea-status">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Contract</th><th>Bias</th><th>Spot</th><th>Entry</th><th>SL</th><th>TP</th><th>Lots</th><th>Spread</th><th>Vol/OI</th><th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="options-idea-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Active Options Trades</h2>
+          <span>Upstox premiums only</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Contract</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Qty</th><th>P/L</th><th>Liquidity</th><th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="options-active-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Closed Options Trades</h2>
+          <span id="op-closed-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Contract</th><th>Exit</th><th>Qty</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit Price</th><th>Realized P/L</th>
+              </tr>
+            </thead>
+            <tbody id="options-closed-body"></tbody>
           </table>
         </div>
       </div>
@@ -312,6 +395,7 @@
           <div><span>Next Holiday</span><strong id="next-holiday">-</strong></div>
           <div><span>Mock Prices</span><strong id="mock-prices">-</strong></div>
           <div><span>Paper Data Policy</span><strong id="paper-data-policy">-</strong></div>
+          <div><span>Options Policy</span><strong id="options-data-policy">-</strong></div>
           <div><span>Move SL To BE</span><strong id="paper-be-enabled">-</strong></div>
           <div><span>BE Trigger RR</span><strong id="paper-be-trigger">-</strong></div>
           <div><span>Profit Lock RR</span><strong id="paper-be-lock">-</strong></div>

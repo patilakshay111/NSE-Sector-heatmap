@@ -1,0 +1,76 @@
+*** Begin Patch
+*** Update File: src/nse_heatmap_dashboard/app.py
+@@
+-        req = request.Request(
+-            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
+-            headers={
+-                "Accept": "application/json",
+-                "Content-Type": "application/json",
+-                "Authorization": f"******",
+-                "User-Agent": (
+-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+-                ),
+-            },
+-        )
++        req = request.Request(
++            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
++            headers={
++                "Accept": "application/json",
++                "Content-Type": "application/json",
++                "Authorization": f"Bearer {self.token}",
++                "User-Agent": (
++                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
++                ),
++            },
++        )
+@@
+-        req = request.Request(
+-            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
+-            headers={
+-                "Accept": "application/json",
+-                "Content-Type": "application/json",
+-                "Authorization": f"******",
+-                "User-Agent": (
+-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+-                ),
+-            },
+-        )
++        req = request.Request(
++            f"{UPSTOX_API_BASE_URL}/instruments/search?{params}",
++            headers={
++                "Accept": "application/json",
++                "Content-Type": "application/json",
++                "Authorization": f"Bearer {self.token}",
++                "User-Agent": (
++                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++                    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
++                ),
++            },
++        )
+@@
+-    def _headers(self) -> dict[str, str]:
+-        return {
+-            "Accept": "application/json",
+-            "Content-Type": "application/json",
+-            "Authorization": f"******",
+-            "User-Agent": (
+-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+-            ),
+-        }
++    def _headers(self) -> dict[str, str]:
++        # Include the configured access token in the Authorization header so
++        # Upstox REST endpoints can be queried.
++        return {
++            "Accept": "application/json",
++            "Content-Type": "application/json",
++            "Authorization": f"Bearer {self.token}",
++            "User-Agent": (
++                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
++                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
++            ),
++        }
+*** End Patch
