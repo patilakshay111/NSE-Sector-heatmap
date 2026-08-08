@@ -49,6 +49,13 @@ from .config import (
     NIFTY_OPTIONS_STRIKE_INTERVAL,
     NIFTY_OPTIONS_STRIKE_OFFSET_STEPS,
     NIFTY_OPTIONS_TRADE_ALLOCATION,
+    OPENING_MOVER_OPTIONS_ENTRY_HOUR,
+    OPENING_MOVER_OPTIONS_ENTRY_MINUTE,
+    OPENING_MOVER_OPTIONS_ENTRY_SECOND,
+    OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS,
+    OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES,
+    OPENING_MOVER_OPTIONS_SL_PCT,
+    OPENING_MOVER_OPTIONS_TARGET_MULTIPLE,
     NSE_ALL_INDICES_API,
     NSE_HEATMAP_URL,
     NSE_HOLIDAY_API,
@@ -57,6 +64,9 @@ from .config import (
     NSE_MARKET_STATUS_API,
     NSE_QUOTE_EQUITY_API,
     NSE_STOCK_INDICES_API,
+    NSE_TOP_GAINERS_API,
+    NSE_TOP_GAINERS_LOSERS_URL,
+    NSE_TOP_LOSERS_API,
     PAPER_BE_LOCK_RR,
     PAPER_BE_TRIGGER_RR,
     PAPER_INITIAL_CAPITAL,
@@ -1356,18 +1366,11 @@ class NiftyOptionsPaperEngine:
         index_spots: dict[str, dict[str, Any]],
         option_quote_provider,
         market_open: bool = True,
+        top_movers: dict[str, Any] | None = None,
+        equity_key_provider=None,
+        previous_m15_close_provider=None,
     ) -> dict[str, Any]:
         now = time.time()
-        if market_open:
-            self._mark_active_trades(option_quote_provider)
-            if self._square_off_due(now):
-                self._square_off_open_trades()
-        if not market_open or not self._entry_session_is_open(now):
-            self.last_ideas = self._retained_ideas([], now, self._session_status())
-            if not self.last_ideas:
-                self.last_idea_date = None
-            self._persist()
-            return self.snapshot()
 
         quote_cache: dict[str, dict[str, Any]] = {}
 
@@ -1377,12 +1380,35 @@ class NiftyOptionsPaperEngine:
                 quote_cache[key] = option_quote_provider(contract)
             return quote_cache[key]
 
+        if market_open:
+            self._mark_active_trades(cached_option_quote)
+            if self._square_off_due(now):
+                self._square_off_open_trades()
+
         for config in self._enabled_indexes():
             spot = self._spot_for_index(index_spots, config)
-            self._update_index_candle(config, spot, now)
+            if market_open:
+                self._update_index_candle(config, spot, now)
         self.last_option_tiles = self._build_option_tiles(index_spots, cached_option_quote, now)
+
+        if not market_open or not self._entry_session_is_open(now):
+            self.last_ideas = self._retained_ideas([], now, self._session_status())
+            if not self.last_ideas:
+                self.last_idea_date = None
+            self._persist()
+            return self.snapshot()
         self._mark_active_trades(cached_option_quote)
         ideas = self._build_ideas(sector_rows, index_spots, cached_option_quote, now)
+        opening_idea = self._build_opening_mover_idea(
+            top_movers or {},
+            cached_option_quote,
+            equity_key_provider,
+            previous_m15_close_provider,
+            now,
+        )
+        if opening_idea:
+            ideas.append(opening_idea)
+        ideas.sort(key=lambda idea: (bool(idea.get("ready")), _to_float(idea.get("score")) or 0), reverse=True)
         self._activate_ideas(ideas)
         self.last_ideas = self._retained_ideas(ideas, now)
         self.last_idea_date = _today_key() if ideas else None
@@ -1514,7 +1540,7 @@ class NiftyOptionsPaperEngine:
             "symbol": contract.get("symbol"),
             "underlying": contract.get("underlying"),
             "underlyingSymbol": contract.get("underlyingSymbol") or contract.get("underlying"),
-            "expiry": contract.get("expiry"),
+            "expiry": quote.get("expiry") or contract.get("expiry"),
             "strike": contract.get("strike"),
             "optionType": contract.get("optionType"),
             "instrumentKey": quote.get("instrumentKey") or contract.get("instrumentKey"),
@@ -1616,7 +1642,7 @@ class NiftyOptionsPaperEngine:
             "optionType": option_type,
             "thesis": "Index Heatmap Options Buyer",
             "thesisDetail": "Buy index CE/PE only when related heatmap breadth, index spot, and a completed M5 breakout agree.",
-            "expiry": contract["expiry"],
+            "expiry": quote.get("expiry") or contract["expiry"],
             "strike": contract["strike"],
             "instrumentKey": quote.get("instrumentKey") or contract.get("instrumentKey"),
             "entry": _round_price(premium),
@@ -1664,6 +1690,300 @@ class NiftyOptionsPaperEngine:
                 "startedAt": candle["startedAt"],
             },
         }
+
+    def _build_opening_mover_idea(
+        self,
+        top_movers: dict[str, Any],
+        option_quote_provider,
+        equity_key_provider,
+        previous_m15_close_provider,
+        now: float,
+    ) -> dict[str, Any] | None:
+        generated_at = _now_label()
+        now_dt = dt.datetime.fromtimestamp(now)
+        today_key = _date_key(now_dt.date())
+        entry_start = dt.datetime.combine(
+            now_dt.date(),
+            dt.time(
+                OPENING_MOVER_OPTIONS_ENTRY_HOUR,
+                OPENING_MOVER_OPTIONS_ENTRY_MINUTE,
+                OPENING_MOVER_OPTIONS_ENTRY_SECOND,
+            ),
+        )
+        entry_end = entry_start + dt.timedelta(seconds=max(1, OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS))
+        max_exit = dt.datetime.combine(now_dt.date(), dt.time(9, 15)) + dt.timedelta(minutes=OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES)
+        confirmation_key = f"OPENING_MOVER_OPTIONS|{today_key}"
+        candidate = self._opening_mover_candidate(top_movers)
+        if not candidate:
+            return self._opening_waiting_idea("Waiting for NSE F&O top gainer/loser.", now, generated_at)
+
+        symbol = str(candidate.get("symbol") or "").strip().upper()
+        mover_direction = str(candidate.get("direction") or "")
+        option_type = "CE" if mover_direction == "gainer" else "PE"
+        direction = "BULLISH" if option_type == "CE" else "BEARISH"
+        percent_change = _to_float(candidate.get("percentChange"))
+        open_price = _to_float(candidate.get("open"))
+        spot = _first_float(candidate.get("ltp"), open_price)
+        if not symbol or open_price is None or spot is None:
+            return self._opening_waiting_idea("Waiting for complete NSE top mover open/LTP.", now, generated_at, candidate)
+
+        already_traded = self.used_confirmations.get(confirmation_key) == 1 or self._opening_mover_trade_exists(today_key)
+        if now_dt < entry_start:
+            status = f"Waiting until {entry_start.strftime('%H:%M:%S')} for opening top mover entry."
+            ready_time = False
+        elif now_dt >= entry_end:
+            status = f"Opening top mover entry window closed after {entry_end.strftime('%H:%M:%S')}."
+            ready_time = False
+        elif already_traded:
+            status = "Opening top mover option trade already placed today."
+            ready_time = False
+        else:
+            status = "Opening top mover entry window active."
+            ready_time = True
+
+        equity_key = equity_key_provider(symbol) if equity_key_provider else None
+        if not equity_key:
+            return self._opening_idea_from_candidate(
+                candidate,
+                option_type,
+                direction,
+                None,
+                None,
+                None,
+                None,
+                False,
+                f"{status} Upstox equity key missing for {symbol}.",
+                generated_at,
+                now,
+                confirmation_key,
+                max_exit,
+            )
+
+        previous_m15 = previous_m15_close_provider(symbol, equity_key) if previous_m15_close_provider else {}
+        previous_close = _to_float((previous_m15 or {}).get("close"))
+        if previous_close is None:
+            return self._opening_idea_from_candidate(
+                candidate,
+                option_type,
+                direction,
+                None,
+                None,
+                None,
+                None,
+                False,
+                f"{status} Previous final M15 close unavailable: {(previous_m15 or {}).get('error') or '-'}",
+                generated_at,
+                now,
+                confirmation_key,
+                max_exit,
+                equity_key,
+                previous_m15,
+            )
+
+        gap_ok = open_price > previous_close if option_type == "CE" else open_price < previous_close
+        if not gap_ok:
+            side_text = "above" if option_type == "CE" else "below"
+            return self._opening_idea_from_candidate(
+                candidate,
+                option_type,
+                direction,
+                None,
+                None,
+                None,
+                None,
+                False,
+                f"{status} Rejected: open {open_price:.2f} is not {side_text} yesterday final M15 close {previous_close:.2f}.",
+                generated_at,
+                now,
+                confirmation_key,
+                max_exit,
+                equity_key,
+                previous_m15,
+            )
+
+        contract = {
+            "symbol": f"{symbol} ATM {option_type}",
+            "underlying": symbol,
+            "underlyingSymbol": symbol,
+            "underlyingInstrumentKey": equity_key,
+            "underlyingType": "EQUITY",
+            "spot": spot,
+            "optionType": option_type,
+        }
+        quote = option_quote_provider(contract)
+        premium = _to_float(quote.get("ltp"))
+        lot_size = int(_to_float(quote.get("lotSize")) or 0)
+        quantity = lot_size
+        stop_loss = premium * (1 - OPENING_MOVER_OPTIONS_SL_PCT) if premium is not None else None
+        target = premium * OPENING_MOVER_OPTIONS_TARGET_MULTIPLE if premium is not None else None
+        liquidity_ok, liquidity_status = self._opening_mover_liquidity_status(quote, lot_size)
+        if not ready_time:
+            final_status = status
+        elif not liquidity_ok:
+            final_status = liquidity_status
+        elif quantity <= 0:
+            final_status = "Stock option lot size unavailable."
+        elif self.snapshot()["availableCapital"] < (premium or 0) * quantity:
+            final_status = "Ready but options capital is fully allocated."
+        else:
+            final_status = f"Ready: opening {mover_direction} {symbol} ATM {option_type} buyer."
+        ready = (
+            ready_time
+            and liquidity_ok
+            and premium is not None
+            and quantity > 0
+            and self.snapshot()["availableCapital"] >= premium * quantity
+        )
+        return self._opening_idea_from_candidate(
+            candidate,
+            option_type,
+            direction,
+            quote,
+            premium,
+            stop_loss,
+            target,
+            ready,
+            final_status,
+            generated_at,
+            now,
+            confirmation_key,
+            max_exit,
+            equity_key,
+            previous_m15,
+        )
+
+    def _opening_idea_from_candidate(
+        self,
+        candidate: dict[str, Any],
+        option_type: str,
+        direction: str,
+        quote: dict[str, Any] | None,
+        premium: float | None,
+        stop_loss: float | None,
+        target: float | None,
+        ready: bool,
+        status: str,
+        generated_at: str,
+        now: float,
+        confirmation_key: str,
+        max_exit: dt.datetime,
+        equity_key: str | None = None,
+        previous_m15: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        quote = quote or {}
+        symbol = str(candidate.get("symbol") or "").strip().upper()
+        lot_size = int(_to_float(quote.get("lotSize")) or 0)
+        quantity = lot_size
+        allocation = (premium or 0) * quantity
+        return {
+            "symbol": quote.get("symbol") or f"{symbol} ATM {option_type}",
+            "underlying": symbol,
+            "underlyingSymbol": symbol,
+            "underlyingInstrumentKey": equity_key,
+            "side": "BUY",
+            "direction": direction,
+            "optionType": option_type,
+            "thesis": "Opening Top Gainer/Loser Option Buyer",
+            "thesisDetail": "Buy one lot of the strongest NSE F&O opening gainer/loser ATM option at 09:15:30 only if today's open crosses yesterday's final M15 close.",
+            "expiry": quote.get("expiry"),
+            "strike": quote.get("strike"),
+            "instrumentKey": quote.get("instrumentKey"),
+            "entry": _round_price(premium),
+            "currentPrice": _round_price(premium),
+            "stopLoss": _round_price(stop_loss),
+            "target": _round_price(target),
+            "lots": 1 if lot_size else 0,
+            "lotSize": lot_size,
+            "quantity": quantity,
+            "allocation": _round_price(allocation),
+            "lossIfSl": _round_price((premium - stop_loss) * quantity) if premium is not None and stop_loss is not None else None,
+            "profitIfTp": _round_price((target - premium) * quantity) if premium is not None and target is not None else None,
+            "ready": ready,
+            "status": status,
+            "originalStatus": status,
+            "fresh": True,
+            "stale": False,
+            "generatedAt": generated_at,
+            "lastSeenAt": generated_at,
+            "expiresAfterSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "liquidityStatus": quote.get("quoteError") or "Liquidity OK." if ready else quote.get("quoteError"),
+            "spreadPct": quote.get("spreadPct"),
+            "bid": quote.get("bid"),
+            "ask": quote.get("ask"),
+            "volume": quote.get("volume"),
+            "oi": quote.get("oi"),
+            "quoteError": quote.get("quoteError"),
+            "confirmationKey": confirmation_key,
+            "confirmationBucket": 1,
+            "confirmationFresh": True,
+            "confirmationUsed": self.used_confirmations.get(confirmation_key) == 1,
+            "spot": _round_price(_first_float(candidate.get("ltp"), candidate.get("open"))),
+            "spotOpen": _round_price(_to_float(candidate.get("open"))),
+            "previousM15Close": _round_price(_to_float((previous_m15 or {}).get("close"))),
+            "previousM15Candle": previous_m15,
+            "maxExitAt": max_exit.strftime("%Y-%m-%d %H:%M:%S"),
+            "maxExitTimestamp": max_exit.timestamp(),
+            "topMover": candidate,
+            "score": round(1000 + abs(_to_float(candidate.get("percentChange")) or 0), 2),
+            "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
+        }
+
+    def _opening_waiting_idea(
+        self,
+        status: str,
+        now: float,
+        generated_at: str,
+        candidate: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "symbol": "-",
+            "underlying": str((candidate or {}).get("symbol") or "-"),
+            "underlyingSymbol": str((candidate or {}).get("symbol") or "-"),
+            "side": "BUY",
+            "direction": "WAIT",
+            "optionType": "-",
+            "thesis": "Opening Top Gainer/Loser Option Buyer",
+            "thesisDetail": "Buy one lot of the strongest NSE F&O opening gainer/loser ATM option at 09:15:30 only if today's open crosses yesterday's final M15 close.",
+            "ready": False,
+            "status": status,
+            "originalStatus": status,
+            "fresh": True,
+            "stale": False,
+            "generatedAt": generated_at,
+            "lastSeenAt": generated_at,
+            "expiresAfterSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "topMover": candidate,
+            "score": 0,
+            "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
+        }
+
+    @staticmethod
+    def _opening_mover_candidate(top_movers: dict[str, Any]) -> dict[str, Any] | None:
+        gainer = top_movers.get("gainer") if isinstance(top_movers, dict) else None
+        loser = top_movers.get("loser") if isinstance(top_movers, dict) else None
+        candidates = [row for row in (gainer, loser) if isinstance(row, dict)]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda row: abs(_to_float(row.get("percentChange")) or 0))
+
+    def _opening_mover_trade_exists(self, date_key: str) -> bool:
+        for trade in [*self.active_trades.values(), *self.closed_trades]:
+            if trade.get("thesis") != "Opening Top Gainer/Loser Option Buyer":
+                continue
+            if _trade_date_key(trade, "entryTime", "openedAt") == date_key:
+                return True
+        return False
+
+    @staticmethod
+    def _opening_mover_liquidity_status(quote: dict[str, Any], lot_size: int) -> tuple[bool, str]:
+        if quote.get("quoteError"):
+            return False, str(quote["quoteError"])
+        premium = _to_float(quote.get("ltp"))
+        if premium is None or premium <= 0:
+            return False, "Waiting for Upstox stock option LTP."
+        if lot_size <= 0:
+            return False, "Stock option lot size unavailable."
+        return True, "Opening stock option quote OK."
 
     def _waiting_idea(
         self,
@@ -1799,11 +2119,17 @@ class NiftyOptionsPaperEngine:
             "lots": idea["lots"],
             "lotSize": idea["lotSize"],
             "quantity": idea["quantity"],
-            "allocation": self.trade_allocation,
+            "allocation": _to_float(idea.get("allocation")) or self.trade_allocation,
             "unrealizedPnl": 0.0,
             "confirmationKey": idea.get("confirmationKey"),
             "confirmationBucket": idea.get("confirmationBucket"),
             "entrySpot": idea.get("spot"),
+            "underlyingInstrumentKey": idea.get("underlyingInstrumentKey"),
+            "previousM15Close": idea.get("previousM15Close"),
+            "previousM15Candle": idea.get("previousM15Candle"),
+            "maxExitAt": idea.get("maxExitAt"),
+            "maxExitTimestamp": idea.get("maxExitTimestamp"),
+            "topMover": idea.get("topMover"),
             "entryTime": entry_time,
             "openedAt": entry_time,
             "status": "ACTIVE",
@@ -1821,6 +2147,8 @@ class NiftyOptionsPaperEngine:
                 self._close_trade(key, trade, "SL", stop_loss)
             elif target is not None and price >= target:
                 self._close_trade(key, trade, "TP", target)
+            elif self._max_hold_due(trade):
+                self._close_trade(key, trade, "M15_EXIT", price)
 
     def _mark_trade(self, trade: dict[str, Any], option_quote_provider) -> None:
         quote = option_quote_provider(trade)
@@ -1836,6 +2164,11 @@ class NiftyOptionsPaperEngine:
         trade["volume"] = quote.get("volume")
         trade["oi"] = quote.get("oi")
         trade["quoteError"] = None
+
+    @staticmethod
+    def _max_hold_due(trade: dict[str, Any], now: float | None = None) -> bool:
+        max_exit = _to_float(trade.get("maxExitTimestamp"))
+        return bool(max_exit and (now or time.time()) >= max_exit)
 
     def _square_off_open_trades(self) -> None:
         for key, trade in list(self.active_trades.items()):
@@ -2012,6 +2345,8 @@ class NiftyOptionsPaperEngine:
             "symbol": symbol,
             "underlying": index_symbol,
             "underlyingSymbol": index_symbol,
+            "underlyingName": index_config.get("name"),
+            "nseSymbol": index_config.get("nseSymbol"),
             "expiry": _date_key(expiry),
             "strike": int(strike),
             "optionType": option_type,
@@ -2183,6 +2518,15 @@ class NiftyOptionsPaperEngine:
             "minOi": NIFTY_OPTIONS_MIN_OI,
             "maxNewTradesPerRefresh": NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH,
             "ideaRetentionSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
+            "openingMover": {
+                "thesis": "Opening Top Gainer/Loser Option Buyer",
+                "entryTime": f"{OPENING_MOVER_OPTIONS_ENTRY_HOUR:02d}:{OPENING_MOVER_OPTIONS_ENTRY_MINUTE:02d}:{OPENING_MOVER_OPTIONS_ENTRY_SECOND:02d}",
+                "entryWindowSeconds": OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS,
+                "maxHoldMinutes": OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES,
+                "lots": 1,
+                "stopLossPct": OPENING_MOVER_OPTIONS_SL_PCT * 100,
+                "targetMultiple": OPENING_MOVER_OPTIONS_TARGET_MULTIPLE,
+            },
             "indexes": [
                 {
                     "symbol": config.get("symbol"),
@@ -2227,6 +2571,20 @@ class NSEClient:
 
     def fetch_trading_holidays(self) -> dict[str, Any]:
         return self._fetch_with_cookie_retry(NSE_HOLIDAY_API)
+
+    def fetch_top_gainers(self) -> dict[str, Any]:
+        return self._fetch_with_cookie_retry(
+            NSE_TOP_GAINERS_API,
+            referer=NSE_TOP_GAINERS_LOSERS_URL,
+            warm_url=NSE_TOP_GAINERS_LOSERS_URL,
+        )
+
+    def fetch_top_losers(self) -> dict[str, Any]:
+        return self._fetch_with_cookie_retry(
+            NSE_TOP_LOSERS_API,
+            referer=NSE_TOP_GAINERS_LOSERS_URL,
+            warm_url=NSE_TOP_GAINERS_LOSERS_URL,
+        )
 
     def _fetch_with_cookie_retry(
         self,
@@ -2473,10 +2831,11 @@ class UpstoxOptionInstrumentResolver:
             {
                 "query": query,
                 "exchanges": "NSE",
-                "segments": "NFO",
-                "instrument_types": "OPTIDX",
+                "segments": "FO",
+                "instrument_types": option_type or "CE,PE",
+                "expiry": str(contract.get("expiry") or "").strip(),
                 "page_number": "1",
-                "records": "25",
+                "records": "30",
             }
         )
         req = request.Request(
@@ -2506,7 +2865,7 @@ class UpstoxOptionInstrumentResolver:
         if match:
             self.last_error = None
             return match
-        self.last_error = f"{contract.get('symbol') or query}: no matching NIFTY {option_type} option found"
+        self.last_error = f"{contract.get('symbol') or query}: no matching {underlying} {option_type} option found"
         return None
 
     @staticmethod
@@ -2521,11 +2880,11 @@ class UpstoxOptionInstrumentResolver:
             row_type = str(row.get("option_type") or row.get("optionType") or row.get("instrument_type") or "").upper()
             row_segment = str(row.get("segment") or "").upper()
             row_name = str(row.get("name") or row.get("trading_symbol") or row.get("tradingSymbol") or "").upper()
-            underlying = str(contract.get("underlying") or contract.get("underlyingSymbol") or "NIFTY").upper()
+            underlying_aliases = UpstoxOptionInstrumentResolver._underlying_aliases(contract)
             row_expiry = str(row.get("expiry") or row.get("expiry_date") or row.get("expiryDate") or "")
             row_strike = _to_float(row.get("strike_price") or row.get("strikePrice") or row.get("strike"))
             row_underlying = str(row.get("underlying_symbol") or row.get("underlyingSymbol") or "").upper()
-            if underlying not in row_name and underlying not in row_underlying:
+            if not any(alias and (alias in row_name or alias in row_underlying) for alias in underlying_aliases):
                 continue
             if option_type and option_type not in row_type and not row_name.endswith(option_type):
                 continue
@@ -2543,6 +2902,16 @@ class UpstoxOptionInstrumentResolver:
             return None
         candidates.sort(key=lambda item: item[0], reverse=True)
         return candidates[0][1]
+
+    @staticmethod
+    def _underlying_aliases(contract: dict[str, Any]) -> set[str]:
+        aliases = {
+            str(contract.get("underlying") or ""),
+            str(contract.get("underlyingSymbol") or ""),
+            str(contract.get("underlyingName") or ""),
+            str(contract.get("nseSymbol") or ""),
+        }
+        return {alias.strip().upper() for alias in aliases if alias and alias.strip()}
 
     def _load_cache(self) -> dict[str, dict[str, Any]]:
         try:
@@ -2591,6 +2960,21 @@ class UpstoxOptionInstrumentResolver:
         )
 
 
+UPSTOX_INDEX_INSTRUMENT_KEYS = {
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "NIFTY 50": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "NIFTY BANK": "NSE_INDEX|Nifty Bank",
+    "FINNIFTY": "NSE_INDEX|Nifty Fin Service",
+    "NIFTY FIN SERVICE": "NSE_INDEX|Nifty Fin Service",
+    "MIDCPNIFTY": "NSE_INDEX|NIFTY MID SELECT",
+    "NIFTY MID SELECT": "NSE_INDEX|NIFTY MID SELECT",
+    "NIFTY MIDCAP SELECT": "NSE_INDEX|NIFTY MID SELECT",
+    "NIFTYNXT50": "NSE_INDEX|Nifty Next 50",
+    "NIFTY NEXT 50": "NSE_INDEX|Nifty Next 50",
+}
+
+
 class UpstoxPriceStreamer:
     def __init__(self, on_prices, app_log: AppLog | None = None) -> None:
         self.on_prices = on_prices
@@ -2618,6 +3002,16 @@ class UpstoxPriceStreamer:
         self.last_rest_quote_count = 0
         self.stream_allowed = False
         self.reconnect_delay_seconds = max(1, UPSTOX_RECONNECT_SECONDS)
+        self.option_chain_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self.option_contract_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self.option_expiry_cache: dict[str, tuple[float, list[str]]] = {}
+        self.previous_m15_close_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+    def resolve_equity_key(self, symbol: str) -> str | None:
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_symbol or not self.token or not self.resolver:
+            return None
+        return self.resolver.resolve([clean_symbol]).get(clean_symbol)
 
     def quote_stocks(self, stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not USE_UPSTOX_PRICE_DATA:
@@ -2685,21 +3079,26 @@ class UpstoxPriceStreamer:
             return {**contract, "quoteError": "Options paper engine requires PRICE_DATA_PROVIDER=upstox."}
         if not self.token or not self.option_resolver:
             return {**contract, "quoteError": "Upstox token missing for option quote."}
+
+        chain_quote = self._quote_option_from_chain(contract)
+        if chain_quote.get("ltp") is not None:
+            return {**contract, **chain_quote}
+
         instrument_key = str(contract.get("instrumentKey") or "") or self.option_resolver.resolve(contract)
         if not instrument_key:
             return {
                 **contract,
-                "quoteError": self.option_resolver.last_error or "Upstox option instrument was not resolved.",
+                "quoteError": chain_quote.get("quoteError") or self.option_resolver.last_error or "Upstox option instrument was not resolved.",
             }
         try:
             rows = self._fetch_quote_rows([instrument_key])
         except Exception as exc:  # noqa: BLE001
             self._log("WARN", "Upstox option quote fetch failed", error=str(exc), symbol=contract.get("symbol"))
-            return {**contract, "instrumentKey": instrument_key, "quoteError": str(exc)}
+            return {**contract, "instrumentKey": instrument_key, "quoteError": chain_quote.get("quoteError") or str(exc)}
         row = rows.get(instrument_key) or next((value for value in rows.values() if isinstance(value, dict)), {})
         quote = self._option_quote_from_row(row)
         if quote.get("ltp") is None:
-            return {**contract, "instrumentKey": instrument_key, "quoteError": "Upstox option LTP missing."}
+            return {**contract, "instrumentKey": instrument_key, "quoteError": chain_quote.get("quoteError") or "Upstox option LTP missing."}
         return {
             **contract,
             **quote,
@@ -2707,6 +3106,64 @@ class UpstoxPriceStreamer:
             "dataSource": "Upstox market-quote/quotes",
             "priceIsMock": False,
         }
+
+    def previous_m15_close(self, symbol: str, instrument_key: str) -> dict[str, Any]:
+        clean_key = str(instrument_key or "").strip()
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_key:
+            return {"symbol": clean_symbol, "close": None, "error": "Upstox equity instrument key missing."}
+        now = time.time()
+        with self.lock:
+            cached = self.previous_m15_close_cache.get(clean_key)
+            if cached and now - cached[0] <= 60 * 60:
+                return cached[1]
+
+        today = dt.date.today()
+        from_date = today - dt.timedelta(days=10)
+        to_date = today - dt.timedelta(days=1)
+        encoded = parse.quote(clean_key, safe="")
+        base_v3 = UPSTOX_API_BASE_URL.replace("/v2", "/v3")
+        req = request.Request(
+            f"{base_v3}/historical-candle/{encoded}/minutes/15/{to_date.isoformat()}/{from_date.isoformat()}",
+            headers=self._headers(),
+        )
+        try:
+            with self._urlopen_with_transient_retry(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            result = {"symbol": clean_symbol, "close": None, "error": str(exc)}
+            with self.lock:
+                self.previous_m15_close_cache[clean_key] = (now, result)
+            return result
+
+        candles = (payload.get("data") or {}).get("candles") if isinstance(payload, dict) else []
+        parsed = []
+        if isinstance(candles, list):
+            for candle in candles:
+                if not isinstance(candle, list) or len(candle) < 5:
+                    continue
+                timestamp = str(candle[0] or "")
+                close = _to_float(candle[4])
+                try:
+                    candle_dt = dt.datetime.fromisoformat(timestamp)
+                except ValueError:
+                    continue
+                if candle_dt.date() >= today or close is None:
+                    continue
+                parsed.append((candle_dt, close))
+        if not parsed:
+            result = {"symbol": clean_symbol, "close": None, "error": "No previous 15-minute candle found."}
+        else:
+            candle_dt, close = max(parsed, key=lambda item: item[0])
+            result = {
+                "symbol": clean_symbol,
+                "close": close,
+                "candleStart": candle_dt.strftime("%Y-%m-%d %H:%M:%S"),
+                "error": None,
+            }
+        with self.lock:
+            self.previous_m15_close_cache[clean_key] = (now, result)
+        return result
 
     def update_targets(self, stocks: list[dict[str, Any]]) -> None:
         if not self.enabled:
@@ -2985,6 +3442,218 @@ class UpstoxPriceStreamer:
         data = payload.get("data") if isinstance(payload, dict) else {}
         return data if isinstance(data, dict) else {}
 
+    def _quote_option_from_chain(self, contract: dict[str, Any]) -> dict[str, Any]:
+        index_key = self._option_chain_index_key(contract)
+        preferred_expiry = str(contract.get("expiry") or "").strip()
+        if not index_key:
+            return {"quoteError": "Upstox option-chain lookup needs index key and expiry."}
+        expiries = [preferred_expiry] if preferred_expiry else []
+        resolved_expiry = self._select_option_chain_expiry(index_key, preferred_expiry)
+        if resolved_expiry and resolved_expiry not in expiries:
+            expiries.append(resolved_expiry)
+        if not expiries:
+            return {"quoteError": f"Upstox option-chain expiry not resolved for {contract.get('symbol') or '-'}."}
+
+        errors = []
+        for expiry in expiries:
+            rows, error = self._fetch_option_chain_rows(index_key, expiry)
+            if error:
+                errors.append(error)
+                continue
+            quote = self._quote_from_chain_rows(index_key, contract, rows)
+            if quote.get("ltp") is not None:
+                return quote
+            errors.append(str(quote.get("quoteError") or f"strike not found for expiry {expiry}"))
+        return {"quoteError": "; ".join(errors) if errors else f"Upstox option-chain quote missing for {contract.get('symbol') or '-'}."}
+
+    def _fetch_option_chain_rows(self, index_key: str, expiry: str) -> tuple[list[dict[str, Any]], str | None]:
+        cache_key = f"{index_key}|{expiry}"
+        now = time.time()
+        with self.lock:
+            cached = self.option_chain_cache.get(cache_key)
+            if cached and now - cached[0] <= max(2, POLL_SECONDS):
+                return cached[1], None
+
+        params = parse.urlencode({"instrument_key": index_key, "expiry_date": expiry})
+        req = request.Request(
+            f"{UPSTOX_API_BASE_URL}/option/chain?{params}",
+            headers=self._headers(),
+        )
+        try:
+            with self._urlopen_with_transient_retry(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return [], f"Upstox option-chain lookup failed for {expiry}: {exc}"
+
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            return [], f"Upstox option-chain returned no rows for {expiry}."
+        with self.lock:
+            self.option_chain_cache[cache_key] = (now, rows)
+        return rows, None
+
+    def _quote_from_chain_rows(self, index_key: str, contract: dict[str, Any], rows: list[dict[str, Any]]) -> dict[str, Any]:
+        strike = _to_float(contract.get("strike"))
+        spot = _to_float(contract.get("spot") or contract.get("underlyingSpot") or contract.get("last") or contract.get("ltp"))
+        option_type = str(contract.get("optionType") or "").strip().upper()
+        option_key = "call_options" if option_type == "CE" else "put_options"
+        candidate_rows = [row for row in rows if isinstance(row, dict)]
+        if strike is None and spot is not None:
+            candidate_rows.sort(
+                key=lambda row: abs((_to_float(row.get("strike_price") or row.get("strikePrice") or row.get("strike")) or spot) - spot)
+            )
+        for row in candidate_rows:
+            row_strike = _to_float(row.get("strike_price") or row.get("strikePrice") or row.get("strike"))
+            if strike is not None and row_strike is not None and abs(row_strike - strike) > 0.01:
+                continue
+            option = row.get(option_key) if isinstance(row.get(option_key), dict) else {}
+            market = option.get("market_data") if isinstance(option.get("market_data"), dict) else {}
+            greeks = option.get("option_greeks") if isinstance(option.get("option_greeks"), dict) else {}
+            quote = self._option_quote_from_chain_market(market, greeks)
+            if quote.get("ltp") is None:
+                return {"quoteError": f"Upstox option-chain LTP missing for {contract.get('symbol') or '-'}."}
+            expiry = str(row.get("expiry") or contract.get("expiry") or "")
+            meta = self._option_contract_meta(index_key, expiry, row_strike, option_type)
+            strike_value = int(row_strike) if row_strike is not None and float(row_strike).is_integer() else row_strike
+            return {
+                **quote,
+                "symbol": meta.get("tradingSymbol") or contract.get("symbol"),
+                "expiry": expiry,
+                "strike": strike_value if strike_value is not None else contract.get("strike"),
+                "lotSize": int(_to_float(meta.get("lotSize")) or _to_float(contract.get("lotSize")) or 0),
+                "instrumentKey": option.get("instrument_key") or option.get("instrumentKey") or meta.get("instrumentKey"),
+                "dataSource": "Upstox option/chain",
+                "priceIsMock": False,
+            }
+        return {"quoteError": f"Upstox option-chain strike not found for {contract.get('symbol') or '-' }."}
+
+    def _option_contract_meta(self, index_key: str, expiry: str, strike: float | None, option_type: str) -> dict[str, Any]:
+        if not index_key or not expiry:
+            return {}
+        rows = self._fetch_option_contract_rows(index_key, expiry)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_type = str(row.get("instrument_type") or row.get("optionType") or "").strip().upper()
+            row_strike = _to_float(row.get("strike_price") or row.get("strikePrice") or row.get("strike"))
+            if option_type and row_type != option_type:
+                continue
+            if strike is not None and row_strike is not None and abs(row_strike - strike) > 0.01:
+                continue
+            return {
+                "instrumentKey": row.get("instrument_key") or row.get("instrumentKey"),
+                "tradingSymbol": row.get("trading_symbol") or row.get("tradingSymbol"),
+                "lotSize": row.get("lot_size") or row.get("lotSize") or row.get("minimum_lot"),
+            }
+        return {}
+
+    def _fetch_option_contract_rows(self, index_key: str, expiry: str = "") -> list[dict[str, Any]]:
+        cache_key = f"{index_key}|{expiry}"
+        now = time.time()
+        with self.lock:
+            cached = self.option_contract_cache.get(cache_key)
+            if cached and now - cached[0] <= 300:
+                return cached[1]
+
+        params = {"instrument_key": index_key}
+        if expiry:
+            params["expiry_date"] = expiry
+        req = request.Request(
+            f"{UPSTOX_API_BASE_URL}/option/contract?{parse.urlencode(params)}",
+            headers=self._headers(),
+        )
+        try:
+            with self._urlopen_with_transient_retry(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return []
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        result = rows if isinstance(rows, list) else []
+        with self.lock:
+            self.option_contract_cache[cache_key] = (now, result)
+        return result
+
+    def _select_option_chain_expiry(self, index_key: str, preferred_expiry: str) -> str | None:
+        expiries = self._option_chain_expiries(index_key)
+        if preferred_expiry and preferred_expiry in expiries:
+            return preferred_expiry
+        parsed = []
+        for expiry in expiries:
+            try:
+                parsed.append((dt.datetime.strptime(expiry, "%Y-%m-%d").date(), expiry))
+            except ValueError:
+                continue
+        today = dt.date.today()
+        future = sorted((item for item in parsed if item[0] >= today), key=lambda item: item[0])
+        if future:
+            return future[0][1]
+        if parsed:
+            return sorted(parsed, key=lambda item: item[0])[-1][1]
+        return None
+
+    def _option_chain_expiries(self, index_key: str) -> list[str]:
+        now = time.time()
+        with self.lock:
+            cached = self.option_expiry_cache.get(index_key)
+            if cached and now - cached[0] <= 300:
+                return cached[1]
+
+        rows = self._fetch_option_contract_rows(index_key)
+        expiries = sorted(
+            {
+                str(row.get("expiry") or "").strip()
+                for row in rows
+                if isinstance(row, dict) and str(row.get("expiry") or "").strip()
+            }
+        )
+        with self.lock:
+            self.option_expiry_cache[index_key] = (now, expiries)
+        return expiries
+
+    @staticmethod
+    def _option_chain_index_key(contract: dict[str, Any]) -> str | None:
+        underlying_key = str(contract.get("underlyingInstrumentKey") or "").strip()
+        if underlying_key:
+            return underlying_key
+        aliases = [
+            str(contract.get("underlying") or ""),
+            str(contract.get("underlyingSymbol") or ""),
+            str(contract.get("underlyingName") or ""),
+            str(contract.get("nseSymbol") or ""),
+        ]
+        for alias in aliases:
+            key = UPSTOX_INDEX_INSTRUMENT_KEYS.get(alias.strip().upper())
+            if key:
+                return key
+        return None
+
+    @staticmethod
+    def _option_quote_from_chain_market(market: dict[str, Any], greeks: dict[str, Any]) -> dict[str, Any]:
+        bid = _first_float(market.get("bid_price"), market.get("bidPrice"), market.get("bid"))
+        ask = _first_float(market.get("ask_price"), market.get("askPrice"), market.get("ask"))
+        raw_ltp = _first_float(market.get("ltp"), market.get("last_price"), market.get("lastPrice"))
+        ltp = raw_ltp if raw_ltp and raw_ltp > 0 else ((bid + ask) / 2 if bid and ask else raw_ltp)
+        previous_close = _first_float(market.get("close_price"), market.get("prev_close"), market.get("previous_close"), market.get("previousClose"))
+        change = _first_float(market.get("net_change"), market.get("netChange"), market.get("change"))
+        if change is None and ltp is not None and previous_close:
+            change = ltp - previous_close
+        percent_change = _first_float(market.get("pchange"), market.get("pChange"), market.get("percent_change"), market.get("percentChange"))
+        if percent_change is None and change is not None and previous_close:
+            percent_change = (change / previous_close) * 100
+        spread_pct = ((ask - bid) / ltp) * 100 if bid and ask and ltp else None
+        return {
+            "ltp": ltp,
+            "change": change,
+            "percentChange": percent_change,
+            "previousClose": previous_close,
+            "bid": _round_price(bid),
+            "ask": _round_price(ask),
+            "spreadPct": round(spread_pct, 2) if spread_pct is not None else None,
+            "volume": _first_float(market.get("volume"), market.get("volume_traded"), market.get("total_volume")),
+            "oi": _first_float(market.get("oi"), market.get("open_interest"), market.get("openInterest")),
+            "iv": _first_float(greeks.get("iv"), greeks.get("implied_volatility"), greeks.get("impliedVolatility")),
+        }
+
     @staticmethod
     def _urlopen_with_transient_retry(req: request.Request, timeout: int):
         last_exc: BaseException | None = None
@@ -3107,6 +3776,7 @@ class FeedState:
     price_streaming: dict[str, Any] = field(default_factory=dict)
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
+    top_movers: dict[str, Any] = field(default_factory=dict)
     nifty_spot: dict[str, Any] | None = None
     index_spots: dict[str, dict[str, Any]] = field(default_factory=dict)
     market_status: dict[str, Any] = field(default_factory=dict)
@@ -3340,6 +4010,7 @@ class NSEStreamer:
         try:
             payload = self.client.fetch_all_indices()
             parsed = self._parse_payload(payload)
+            top_movers = self._fetch_top_movers()
             stock_groups = self._fetch_sector_stock_groups(parsed["sector_rows"])
             with self.paper_lock:
                 active_targets = self.paper_engine.active_mark_targets()
@@ -3370,6 +4041,9 @@ class NSEStreamer:
                     parsed["index_spots"],
                     self.price_streamer.quote_option,
                     market_open=bool(market_clock.get("shouldStream")),
+                    top_movers=top_movers,
+                    equity_key_provider=self.price_streamer.resolve_equity_key,
+                    previous_m15_close_provider=self.price_streamer.previous_m15_close,
                 )
             with self.lock:
                 self.state.last_error = None
@@ -3381,6 +4055,7 @@ class NSEStreamer:
                 self.state.options_paper_trading = options_paper
                 self.state.max_gainer = parsed["max_gainer"]
                 self.state.max_loser = parsed["max_loser"]
+                self.state.top_movers = top_movers
                 self.state.nifty_spot = parsed["nifty_spot"]
                 self.state.index_spots = parsed["index_spots"]
                 self.state.market_status = self.market_status_cache or parsed["market_status"]
@@ -3549,6 +4224,65 @@ class NSEStreamer:
                 f"{DAILY_STOCK_SL_LIMIT} SL per stock threshold"
             ),
         }
+
+    def _fetch_top_movers(self) -> dict[str, Any]:
+        checked_at = _now_label()
+        try:
+            gainers = self._parse_top_mover_payload(self.client.fetch_top_gainers(), "gainer")
+            losers = self._parse_top_mover_payload(self.client.fetch_top_losers(), "loser")
+            return {
+                "checkedAt": checked_at,
+                "source": NSE_TOP_GAINERS_LOSERS_URL,
+                "gainer": gainers[0] if gainers else None,
+                "loser": losers[0] if losers else None,
+                "gainers": gainers[:5],
+                "losers": losers[:5],
+                "error": None,
+            }
+        except Exception as exc:  # noqa: BLE001 - opening mover thesis should not break the main dashboard
+            self.app_log.warn("NSE top movers fetch failed", error=str(exc))
+            return {
+                "checkedAt": checked_at,
+                "source": NSE_TOP_GAINERS_LOSERS_URL,
+                "gainer": None,
+                "loser": None,
+                "gainers": [],
+                "losers": [],
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _parse_top_mover_payload(payload: dict[str, Any], direction: str) -> list[dict[str, Any]]:
+        rows = (payload.get("FOSec") or {}).get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+        parsed = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or "").strip().upper()
+            if not symbol:
+                continue
+            parsed.append(
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "series": row.get("series"),
+                    "open": _first_float(row.get("open_price"), row.get("openPrice"), row.get("open")),
+                    "high": _first_float(row.get("high_price"), row.get("highPrice"), row.get("high")),
+                    "low": _first_float(row.get("low_price"), row.get("lowPrice"), row.get("low")),
+                    "ltp": _first_float(row.get("ltp"), row.get("lastPrice"), row.get("last")),
+                    "percentChange": _first_float(row.get("perChange"), row.get("net_price"), row.get("percentChange")),
+                    "volume": _first_float(row.get("trade_quantity"), row.get("volume")),
+                    "turnover": _first_float(row.get("turnover")),
+                    "raw": row,
+                }
+            )
+        if direction == "loser":
+            parsed.sort(key=lambda item: _to_float(item.get("percentChange")) or 0)
+        else:
+            parsed.sort(key=lambda item: _to_float(item.get("percentChange")) or 0, reverse=True)
+        return parsed
 
     def _fetch_sector_stock_groups(self, sector_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         gain_sectors = [

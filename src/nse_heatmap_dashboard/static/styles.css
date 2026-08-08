@@ -455,7 +455,16 @@ button.danger {
 .option-contract {
   align-items: center;
   border-left: 4px solid var(--line);
+  flex-wrap: wrap;
   padding-left: 8px;
+}
+
+.option-contract .quote-error {
+  color: var(--danger);
+  flex-basis: 100%;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
 }
 
 .option-contract.call {

@@ -39,6 +39,7 @@ function fmt(value, digits = 2) {
 }
 
 function pct(value) {
+  if (!hasNumber(value)) return "-";
   const n = Number(value);
   if (!Number.isFinite(n)) return "-";
   return `${n >= 0 ? "+" : ""}${fmt(n, 2)}%`;
@@ -78,6 +79,13 @@ function optionIdeaMeta(idea) {
     return idea.underlying && idea.underlying !== idea.underlyingSymbol ? idea.underlying : "";
   }
   return `${idea.expiry || "-"} / ${idea.optionType || "-"} ${fmtMaybe(idea.strike, 0)}`;
+}
+
+function optionIdeaSpotMeta(idea) {
+  if (idea.thesis === "Opening Top Gainer/Loser Option Buyer") {
+    return `O ${fmtMaybe(idea.spotOpen)} / Prev M15 ${fmtMaybe(idea.previousM15Close)}`;
+  }
+  return `O ${fmtMaybe(idea.spotOpen)} / M5 ${fmtMaybe(idea.m5?.low)}-${fmtMaybe(idea.m5?.high)}`;
 }
 
 function compactIdeaStatus(idea) {
@@ -482,9 +490,10 @@ function renderOptionsPriceTiles(options) {
           <span>${fmt(contract.strike, 0)} / ${safe(contract.expiry || "-")}</span>
         </div>
         <div>
-          <strong>${fmt(contract.ltp)}</strong>
+          <strong>${fmtMaybe(contract.ltp)}</strong>
           <span class="${changeClass(contract.percentChange)}">${pct(contract.percentChange)}</span>
         </div>
+        ${contract.quoteError ? `<small class="quote-error">${safe(contract.quoteError)}</small>` : ""}
       </div>
     `).join("") : `<div class="empty-state">${safe(tile.status || "Waiting for Upstox option quote.")}</div>`;
     return `
@@ -538,7 +547,7 @@ function renderOptionsPaper(options) {
         <td class="${idea.direction === "BULLISH" ? "good" : idea.direction === "BEARISH" ? "bad" : "warn"}">${safe(idea.direction || "-")}</td>
         <td>
           ${fmtMaybe(idea.spot)}
-          <span>O ${fmtMaybe(idea.spotOpen)} / M5 ${fmtMaybe(idea.m5?.low)}-${fmtMaybe(idea.m5?.high)}</span>
+          <span>${safe(optionIdeaSpotMeta(idea))}</span>
         </td>
         <td>${fmtMaybe(idea.entry)}</td>
         <td>${fmtMaybe(idea.stopLoss)}</td>
@@ -555,7 +564,7 @@ function renderOptionsPaper(options) {
     <tr>
       <td>
         <strong>${safe(trade.id)}</strong>
-        <span>${safe(trade.direction || "-")}</span>
+        <span>${safe(trade.thesis || trade.direction || "-")}</span>
       </td>
       <td>
         ${safe(trade.symbol)}
