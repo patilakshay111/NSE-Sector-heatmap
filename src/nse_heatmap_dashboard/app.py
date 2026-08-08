@@ -17,6 +17,15 @@ import webbrowser
 
 from .config import (
     BUY_SECTOR_THRESHOLD,
+    CLOSING_VOLUME_ENTRY_WINDOW_MINUTES,
+    CLOSING_VOLUME_LOOKBACK_DAYS,
+    CLOSING_VOLUME_MAX_RISK_PCT,
+    CLOSING_VOLUME_MIN_BODY_PCT,
+    CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT,
+    CLOSING_VOLUME_SPIKE_MULTIPLE,
+    CLOSING_VOLUME_TARGET_RR,
+    CLOSING_VOLUME_TOP_COUNT,
+    CLOSING_VOLUME_UNIVERSE,
     DAILY_STOCK_SL_LIMIT,
     DATA_ROOT,
     DASHBOARD_HOST,
@@ -54,8 +63,10 @@ from .config import (
     OPENING_MOVER_OPTIONS_ENTRY_SECOND,
     OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS,
     OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES,
+    OPENING_MOVER_OPTIONS_MAX_TRADES,
     OPENING_MOVER_OPTIONS_SL_PCT,
     OPENING_MOVER_OPTIONS_TARGET_MULTIPLE,
+    OPENING_MOVER_OPTIONS_TOP_COUNT,
     NSE_ALL_INDICES_API,
     NSE_HEATMAP_URL,
     NSE_HOLIDAY_API,
@@ -149,6 +160,40 @@ def _parse_nse_date(value: Any) -> dt.date | None:
         except ValueError:
             continue
     return None
+
+
+def _parse_iso_datetime(value: Any) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _candle_row(candle: Any) -> dict[str, Any] | None:
+    if not isinstance(candle, list) or len(candle) < 6:
+        return None
+    candle_dt = _parse_iso_datetime(candle[0])
+    open_price = _to_float(candle[1])
+    high = _to_float(candle[2])
+    low = _to_float(candle[3])
+    close = _to_float(candle[4])
+    volume = _to_float(candle[5])
+    if candle_dt is None or open_price is None or high is None or low is None or close is None or volume is None:
+        return None
+    return {
+        "timestamp": str(candle[0] or ""),
+        "datetime": candle_dt,
+        "date": candle_dt.date(),
+        "time": candle_dt.time(),
+        "open": open_price,
+        "high": high,
+        "low": low,
+        "close": close,
+        "volume": volume,
+    }
 
 
 def _to_float(value: Any) -> float | None:
@@ -362,6 +407,7 @@ class PaperTradingEngine:
         self.active_trades: dict[str, dict[str, Any]] = {}
         self.closed_trades: list[dict[str, Any]] = []
         self.fib_watch: dict[str, dict[str, Any]] = {}
+        self.closing_volume_shortlist: dict[str, Any] = {}
         self.used_confirmations: dict[str, int] = {}
         self.next_trade_id = 1
         self.last_ideas: list[dict[str, Any]] = []
@@ -378,6 +424,7 @@ class PaperTradingEngine:
     ) -> dict[str, Any]:
         stocks = self._selected_stocks(stock_groups)
         mark_stocks = self._merge_mark_stocks(stocks, mark_stocks or [])
+        closing_volume_stocks = self._closing_volume_live_stocks(mark_stocks)
         now = time.time()
         entry_session_open = self._entry_session_is_open(now)
         square_off_due = self._square_off_due(now)
@@ -393,6 +440,7 @@ class PaperTradingEngine:
             self._update_candle(stock, now)
         self._mark_active_trades(mark_stocks)
         ideas = self._build_ideas(stocks, now)
+        ideas.extend(self._closing_volume_ideas(closing_volume_stocks, now))
         self._activate_ready_ideas(ideas)
         self._mark_active_trades(mark_stocks)
         self.last_ideas = ideas
@@ -408,6 +456,28 @@ class PaperTradingEngine:
             str(trade.get("symbol") or "").strip(): str(trade.get("sector") or "").strip()
             for trade in self.active_trades.values()
             if trade.get("symbol")
+        }
+
+    def set_closing_volume_shortlist(self, shortlist: dict[str, Any]) -> None:
+        if not isinstance(shortlist, dict):
+            return
+        self.closing_volume_shortlist = shortlist
+        self._persist()
+
+    def closing_volume_mark_targets(self, target_date: dt.date | None = None) -> dict[str, str]:
+        target_key = _date_key(target_date or dt.date.today())
+        if self.closing_volume_shortlist.get("targetDate") != target_key:
+            return {}
+        if self.closing_volume_shortlist.get("universe") != CLOSING_VOLUME_UNIVERSE:
+            return {}
+        rows = self.closing_volume_shortlist.get("selected")
+        if not isinstance(rows, list):
+            return {}
+        return {
+            str(row.get("symbol") or "").strip().upper(): f"Closing Volume {CLOSING_VOLUME_UNIVERSE}"
+            for row in rows
+            if str(row.get("symbol") or "").strip()
+            and (_to_float(row.get("volumeSpike")) or 0) >= CLOSING_VOLUME_SPIKE_MULTIPLE
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -471,6 +541,7 @@ class PaperTradingEngine:
                 "sectorMomentumPartialExitPct": SECTOR_MOMENTUM_PARTIAL_EXIT_PCT,
                 "sectorMomentumRunnerSlLockRr": SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR,
             },
+            "closingVolumeShortlist": self.closing_volume_shortlist,
             "ideaCount": len(self.last_ideas),
             "ideasDate": self.last_ideas_date,
             "sessionOpen": self._entry_session_is_open(),
@@ -649,6 +720,11 @@ class PaperTradingEngine:
             self.realized_pnl = _to_float(payload.get("realizedPnl")) or 0.0
             self.candles = payload.get("candles") if isinstance(payload.get("candles"), dict) else {}
             self.fib_watch = payload.get("fibWatch") if isinstance(payload.get("fibWatch"), dict) else {}
+            self.closing_volume_shortlist = (
+                payload.get("closingVolumeShortlist")
+                if isinstance(payload.get("closingVolumeShortlist"), dict)
+                else {}
+            )
             self.used_confirmations = self._normalize_used_confirmations(payload.get("usedConfirmations"))
             open_trades = payload.get("openTrades") or payload.get("activeTrades")
             self.active_trades = open_trades if isinstance(open_trades, dict) else {}
@@ -675,6 +751,7 @@ class PaperTradingEngine:
             "nextTradeId": self.next_trade_id,
             "candles": self.candles,
             "fibWatch": self.fib_watch,
+            "closingVolumeShortlist": self.closing_volume_shortlist,
             "usedConfirmations": self.used_confirmations,
             "openTrades": self.active_trades,
             "activeTrades": self.active_trades,
@@ -782,6 +859,40 @@ class PaperTradingEngine:
                 by_symbol[symbol] = stock
         return list(by_symbol.values())
 
+    def _closing_volume_live_stocks(self, mark_stocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        targets = self.closing_volume_mark_targets()
+        if not targets:
+            return []
+        setup_rows = self.closing_volume_shortlist.get("selected")
+        if not isinstance(setup_rows, list):
+            return []
+        setup_by_symbol = {
+            str(row.get("symbol") or "").strip().upper(): row
+            for row in setup_rows
+            if str(row.get("symbol") or "").strip()
+            and (_to_float(row.get("volumeSpike")) or 0) >= CLOSING_VOLUME_SPIKE_MULTIPLE
+        }
+        mark_by_symbol = {
+            str(stock.get("symbol") or "").strip().upper(): stock
+            for stock in mark_stocks
+            if str(stock.get("symbol") or "").strip()
+        }
+        stocks = []
+        for symbol, setup in setup_by_symbol.items():
+            mark = mark_by_symbol.get(symbol)
+            if not mark or _to_float(mark.get("current")) is None:
+                continue
+            stocks.append(
+                {
+                    **mark,
+                    "symbol": symbol,
+                    "sector": f"Closing Volume {CLOSING_VOLUME_UNIVERSE}",
+                    "direction": "gain" if setup.get("side") == "BUY" else "loss",
+                    "closingVolumeSetup": setup,
+                }
+            )
+        return stocks
+
     def _update_candle(self, stock: dict[str, Any], now: float) -> None:
         symbol = stock["symbol"]
         price = _to_float(stock.get("current"))
@@ -821,6 +932,121 @@ class PaperTradingEngine:
             ideas.append(self._vwap_idea(stock, side, now))
             ideas.append(self._fib_idea(stock, side, now))
         return [idea for idea in ideas if idea]
+
+    def _closing_volume_ideas(self, stocks: list[dict[str, Any]], now: float) -> list[dict[str, Any]]:
+        return [idea for stock in stocks if (idea := self._closing_volume_idea(stock, now))]
+
+    def _closing_volume_idea(self, stock: dict[str, Any], now: float) -> dict[str, Any] | None:
+        setup = stock.get("closingVolumeSetup")
+        if not isinstance(setup, dict):
+            return None
+        symbol = str(stock.get("symbol") or setup.get("symbol") or "").strip().upper()
+        side = str(setup.get("side") or "").strip().upper()
+        price = _to_float(stock.get("current"))
+        final_close = _to_float(setup.get("final15Close"))
+        final_low = _to_float(setup.get("final15Low"))
+        final_high = _to_float(setup.get("final15High"))
+        if not symbol or side not in {"BUY", "SHORT"} or price is None or final_close is None or final_low is None or final_high is None:
+            return None
+
+        now_dt = dt.datetime.fromtimestamp(now)
+        entry_start = dt.datetime.combine(now_dt.date(), dt.time(PAPER_START_HOUR, PAPER_START_MINUTE))
+        entry_end = entry_start + dt.timedelta(minutes=max(1, CLOSING_VOLUME_ENTRY_WINDOW_MINUTES))
+        confirmation_key = self._confirmation_key(symbol, side, "Closing Volume Institutional Followthrough")
+        confirmation_bucket = int(now_dt.strftime("%Y%m%d"))
+        confirmation_used = self.used_confirmations.get(confirmation_key) == confirmation_bucket
+        active_key = self._trade_key(symbol, "Closing Volume Institutional Followthrough")
+        opening_reference = _first_float(stock.get("open"), price)
+
+        if now_dt < entry_start:
+            status = f"Waiting until {entry_start.strftime('%H:%M')} for closing-volume followthrough entry"
+            time_ok = False
+        elif now_dt >= entry_end:
+            status = f"Opening followthrough window closed after {entry_end.strftime('%H:%M')}"
+            time_ok = False
+        else:
+            status = "Opening followthrough window active"
+            time_ok = True
+
+        if side == "BUY":
+            direction_ok = opening_reference is not None and opening_reference >= final_close and price >= final_close
+            stop_loss = max(final_low, price * (1 - CLOSING_VOLUME_MAX_RISK_PCT))
+            if stop_loss >= price:
+                stop_loss = price * (1 - CLOSING_VOLUME_MAX_RISK_PCT)
+            risk = price - stop_loss
+            target = price + (risk * CLOSING_VOLUME_TARGET_RR)
+        else:
+            direction_ok = opening_reference is not None and opening_reference <= final_close and price <= final_close
+            stop_loss = min(final_high, price * (1 + CLOSING_VOLUME_MAX_RISK_PCT))
+            if stop_loss <= price:
+                stop_loss = price * (1 + CLOSING_VOLUME_MAX_RISK_PCT)
+            risk = stop_loss - price
+            target = price - (risk * CLOSING_VOLUME_TARGET_RR)
+
+        rr = _risk_reward(side, price, stop_loss, target)
+        quantity = max(1, int(self.trade_allocation // price)) if price > 0 else 0
+        ready = bool(
+            time_ok
+            and direction_ok
+            and not confirmation_used
+            and active_key not in self.active_trades
+            and rr is not None
+            and rr > MIN_TRADE_RR
+            and quantity > 0
+        )
+        if active_key in self.active_trades:
+            status = "Already active"
+        elif confirmation_used:
+            status = "Opening followthrough already traded today"
+        elif time_ok and not direction_ok:
+            direction_text = "above" if side == "BUY" else "below"
+            status = f"Rejected: open/current is not {direction_text} Friday final 15m close {final_close:.2f}"
+        elif ready:
+            status = "Ready: closing-volume institutional followthrough at open"
+
+        loss_if_sl = abs(_trade_pnl(side, price, stop_loss, quantity))
+        profit_if_tp = max(0.0, _trade_pnl(side, price, target, quantity))
+        return {
+            "symbol": symbol,
+            "sector": f"Closing Volume {CLOSING_VOLUME_UNIVERSE}",
+            "side": side,
+            "thesis": "Closing Volume Institutional Followthrough",
+            "thesisDetail": f"After market close, shortlist {CLOSING_VOLUME_UNIVERSE} stocks with institutional-style final 15-minute volume; next session, enter at the open only if price follows that direction.",
+            "entry": _round_price(price),
+            "stopLoss": _round_price(stop_loss),
+            "target": _round_price(target),
+            "currentPrice": _round_price(price),
+            "rr": round(rr, 2) if rr is not None else None,
+            "lossIfSl": _round_price(loss_if_sl),
+            "profitIfTp": _round_price(profit_if_tp),
+            "allocation": self.trade_allocation,
+            "quantity": quantity,
+            "ready": ready,
+            "status": status,
+            "confirmationKey": confirmation_key,
+            "confirmationBucket": confirmation_bucket,
+            "confirmationFresh": time_ok,
+            "confirmationUsed": confirmation_used,
+            "m5": {
+                "bucket": confirmation_bucket,
+                "open": _round_price(_to_float(setup.get("final15Open"))),
+                "high": _round_price(final_high),
+                "low": _round_price(final_low),
+                "close": _round_price(final_close),
+                "ticks": 1,
+                "startedAt": str(setup.get("final15Start") or "-"),
+            },
+            "sourceSessionDate": setup.get("sessionDate"),
+            "targetDate": setup.get("targetDate"),
+            "volumeSpike": setup.get("volumeSpike"),
+            "dailyVolumeSharePct": setup.get("dailyVolumeSharePct"),
+            "avgDailyVolume": setup.get("avgDailyVolume"),
+            "avgFinal15Volume": setup.get("avgFinal15Volume"),
+            "final15Volume": setup.get("final15Volume"),
+            "final15BodyPct": setup.get("final15BodyPct"),
+            "openingReference": _round_price(opening_reference),
+            "closingVolumeSetup": setup,
+        }
 
     def _sector_momentum_idea(self, stock: dict[str, Any], side: str, now: float) -> dict[str, Any] | None:
         price = _to_float(stock.get("current"))
@@ -1145,6 +1371,16 @@ class PaperTradingEngine:
             "partialExitPct": idea.get("partialExitPct"),
             "runnerSlLockRr": idea.get("runnerSlLockRr"),
             "tp1": idea["target"],
+            "sourceSessionDate": idea.get("sourceSessionDate"),
+            "targetDate": idea.get("targetDate"),
+            "volumeSpike": idea.get("volumeSpike"),
+            "dailyVolumeSharePct": idea.get("dailyVolumeSharePct"),
+            "avgDailyVolume": idea.get("avgDailyVolume"),
+            "avgFinal15Volume": idea.get("avgFinal15Volume"),
+            "final15Volume": idea.get("final15Volume"),
+            "final15BodyPct": idea.get("final15BodyPct"),
+            "openingReference": idea.get("openingReference"),
+            "closingVolumeSetup": idea.get("closingVolumeSetup"),
             "unrealizedPnl": 0.0,
             "stopMovedToBe": False,
             "stopMoveReason": "",
@@ -1399,15 +1635,14 @@ class NiftyOptionsPaperEngine:
             return self.snapshot()
         self._mark_active_trades(cached_option_quote)
         ideas = self._build_ideas(sector_rows, index_spots, cached_option_quote, now)
-        opening_idea = self._build_opening_mover_idea(
+        opening_ideas = self._build_opening_mover_ideas(
             top_movers or {},
             cached_option_quote,
             equity_key_provider,
             previous_m15_close_provider,
             now,
         )
-        if opening_idea:
-            ideas.append(opening_idea)
+        ideas.extend(opening_ideas)
         ideas.sort(key=lambda idea: (bool(idea.get("ready")), _to_float(idea.get("score")) or 0), reverse=True)
         self._activate_ideas(ideas)
         self.last_ideas = self._retained_ideas(ideas, now)
@@ -1691,14 +1926,14 @@ class NiftyOptionsPaperEngine:
             },
         }
 
-    def _build_opening_mover_idea(
+    def _build_opening_mover_ideas(
         self,
         top_movers: dict[str, Any],
         option_quote_provider,
         equity_key_provider,
         previous_m15_close_provider,
         now: float,
-    ) -> dict[str, Any] | None:
+    ) -> list[dict[str, Any]]:
         generated_at = _now_label()
         now_dt = dt.datetime.fromtimestamp(now)
         today_key = _date_key(now_dt.date())
@@ -1712,34 +1947,69 @@ class NiftyOptionsPaperEngine:
         )
         entry_end = entry_start + dt.timedelta(seconds=max(1, OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS))
         max_exit = dt.datetime.combine(now_dt.date(), dt.time(9, 15)) + dt.timedelta(minutes=OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES)
-        confirmation_key = f"OPENING_MOVER_OPTIONS|{today_key}"
-        candidate = self._opening_mover_candidate(top_movers)
-        if not candidate:
-            return self._opening_waiting_idea("Waiting for NSE F&O top gainer/loser.", now, generated_at)
-
-        symbol = str(candidate.get("symbol") or "").strip().upper()
-        mover_direction = str(candidate.get("direction") or "")
-        option_type = "CE" if mover_direction == "gainer" else "PE"
-        direction = "BULLISH" if option_type == "CE" else "BEARISH"
-        percent_change = _to_float(candidate.get("percentChange"))
-        open_price = _to_float(candidate.get("open"))
-        spot = _first_float(candidate.get("ltp"), open_price)
-        if not symbol or open_price is None or spot is None:
-            return self._opening_waiting_idea("Waiting for complete NSE top mover open/LTP.", now, generated_at, candidate)
-
-        already_traded = self.used_confirmations.get(confirmation_key) == 1 or self._opening_mover_trade_exists(today_key)
         if now_dt < entry_start:
             status = f"Waiting until {entry_start.strftime('%H:%M:%S')} for opening top mover entry."
             ready_time = False
         elif now_dt >= entry_end:
             status = f"Opening top mover entry window closed after {entry_end.strftime('%H:%M:%S')}."
             ready_time = False
-        elif already_traded:
-            status = "Opening top mover option trade already placed today."
-            ready_time = False
         else:
             status = "Opening top mover entry window active."
             ready_time = True
+
+        candidates = self._opening_mover_candidates(top_movers)
+        if not candidates:
+            return [self._opening_waiting_idea("Waiting for NSE F&O top gainer/loser.", now, generated_at)]
+
+        ideas = [
+            self._build_opening_mover_candidate_idea(
+                candidate,
+                option_quote_provider,
+                equity_key_provider,
+                previous_m15_close_provider,
+                now,
+                generated_at,
+                today_key,
+                status,
+                ready_time,
+                max_exit,
+            )
+            for candidate in candidates
+        ]
+        ideas.sort(key=lambda idea: (bool(idea.get("ready")), _to_float(idea.get("score")) or 0), reverse=True)
+        return ideas
+
+    def _build_opening_mover_candidate_idea(
+        self,
+        candidate: dict[str, Any],
+        option_quote_provider,
+        equity_key_provider,
+        previous_m15_close_provider,
+        now: float,
+        generated_at: str,
+        today_key: str,
+        status: str,
+        ready_time: bool,
+        max_exit: dt.datetime,
+    ) -> dict[str, Any]:
+        symbol = str(candidate.get("symbol") or "").strip().upper()
+        mover_direction = str(candidate.get("direction") or "")
+        option_type = "CE" if mover_direction == "gainer" else "PE"
+        direction = "BULLISH" if option_type == "CE" else "BEARISH"
+        open_price = _to_float(candidate.get("open"))
+        spot = _first_float(candidate.get("ltp"), open_price)
+        confirmation_key = f"OPENING_MOVER_OPTIONS|{today_key}|{symbol}|{option_type}"
+        if not symbol or open_price is None or spot is None:
+            return self._opening_waiting_idea("Waiting for complete NSE top mover open/LTP.", now, generated_at, candidate)
+
+        already_traded = self.used_confirmations.get(confirmation_key) == 1 or self._opening_mover_trade_exists(today_key, symbol, option_type)
+        daily_count = self._opening_mover_trade_count(today_key)
+        if already_traded:
+            ready_time = False
+            status = f"Opening top mover option trade already placed for {symbol} {option_type} today."
+        elif daily_count >= max(1, OPENING_MOVER_OPTIONS_MAX_TRADES):
+            ready_time = False
+            status = f"Opening top mover max trades reached ({OPENING_MOVER_OPTIONS_MAX_TRADES})."
 
         equity_key = equity_key_provider(symbol) if equity_key_provider else None
         if not equity_key:
@@ -1817,6 +2087,7 @@ class NiftyOptionsPaperEngine:
         stop_loss = premium * (1 - OPENING_MOVER_OPTIONS_SL_PCT) if premium is not None else None
         target = premium * OPENING_MOVER_OPTIONS_TARGET_MULTIPLE if premium is not None else None
         liquidity_ok, liquidity_status = self._opening_mover_liquidity_status(quote, lot_size)
+        score = self._opening_mover_score(candidate, quote, previous_close)
         if not ready_time:
             final_status = status
         elif not liquidity_ok:
@@ -1850,6 +2121,7 @@ class NiftyOptionsPaperEngine:
             max_exit,
             equity_key,
             previous_m15,
+            score,
         )
 
     def _opening_idea_from_candidate(
@@ -1869,6 +2141,7 @@ class NiftyOptionsPaperEngine:
         max_exit: dt.datetime,
         equity_key: str | None = None,
         previous_m15: dict[str, Any] | None = None,
+        score: float | None = None,
     ) -> dict[str, Any]:
         quote = quote or {}
         symbol = str(candidate.get("symbol") or "").strip().upper()
@@ -1906,12 +2179,15 @@ class NiftyOptionsPaperEngine:
             "generatedAt": generated_at,
             "lastSeenAt": generated_at,
             "expiresAfterSeconds": NIFTY_OPTIONS_IDEA_RETENTION_SECONDS,
-            "liquidityStatus": quote.get("quoteError") or "Liquidity OK." if ready else quote.get("quoteError"),
+            "liquidityStatus": quote.get("quoteError") or ("Opening stock option quote OK." if ready else None),
             "spreadPct": quote.get("spreadPct"),
             "bid": quote.get("bid"),
             "ask": quote.get("ask"),
             "volume": quote.get("volume"),
             "oi": quote.get("oi"),
+            "prevOi": quote.get("prevOi"),
+            "oiChange": quote.get("oiChange"),
+            "oiChangePct": _round_price(_to_float(quote.get("oiChangePct"))),
             "quoteError": quote.get("quoteError"),
             "confirmationKey": confirmation_key,
             "confirmationBucket": 1,
@@ -1924,7 +2200,7 @@ class NiftyOptionsPaperEngine:
             "maxExitAt": max_exit.strftime("%Y-%m-%d %H:%M:%S"),
             "maxExitTimestamp": max_exit.timestamp(),
             "topMover": candidate,
-            "score": round(1000 + abs(_to_float(candidate.get("percentChange")) or 0), 2),
+            "score": round(score if score is not None else 1000 + abs(_to_float(candidate.get("percentChange")) or 0), 2),
             "checkedAt": time.strftime("%H:%M:%S", time.localtime(now)),
         }
 
@@ -1958,21 +2234,51 @@ class NiftyOptionsPaperEngine:
         }
 
     @staticmethod
-    def _opening_mover_candidate(top_movers: dict[str, Any]) -> dict[str, Any] | None:
-        gainer = top_movers.get("gainer") if isinstance(top_movers, dict) else None
-        loser = top_movers.get("loser") if isinstance(top_movers, dict) else None
-        candidates = [row for row in (gainer, loser) if isinstance(row, dict)]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda row: abs(_to_float(row.get("percentChange")) or 0))
+    def _opening_mover_candidates(top_movers: dict[str, Any]) -> list[dict[str, Any]]:
+        if not isinstance(top_movers, dict):
+            return []
+        gainers = top_movers.get("gainers")
+        losers = top_movers.get("losers")
+        if not isinstance(gainers, list):
+            gainers = [top_movers.get("gainer")] if isinstance(top_movers.get("gainer"), dict) else []
+        if not isinstance(losers, list):
+            losers = [top_movers.get("loser")] if isinstance(top_movers.get("loser"), dict) else []
+        rows = gainers[:OPENING_MOVER_OPTIONS_TOP_COUNT] + losers[:OPENING_MOVER_OPTIONS_TOP_COUNT]
+        candidates = [row for row in rows if isinstance(row, dict) and str(row.get("symbol") or "").strip()]
+        candidates.sort(key=lambda row: abs(_to_float(row.get("percentChange")) or 0), reverse=True)
+        return candidates
 
-    def _opening_mover_trade_exists(self, date_key: str) -> bool:
+    def _opening_mover_trade_exists(self, date_key: str, symbol: str, option_type: str) -> bool:
+        clean_symbol = str(symbol or "").strip().upper()
+        clean_type = str(option_type or "").strip().upper()
         for trade in [*self.active_trades.values(), *self.closed_trades]:
             if trade.get("thesis") != "Opening Top Gainer/Loser Option Buyer":
                 continue
             if _trade_date_key(trade, "entryTime", "openedAt") == date_key:
-                return True
+                trade_symbol = str(trade.get("underlyingSymbol") or trade.get("underlying") or "").strip().upper()
+                trade_type = str(trade.get("optionType") or "").strip().upper()
+                if trade_symbol == clean_symbol and trade_type == clean_type:
+                    return True
         return False
+
+    def _opening_mover_trade_count(self, date_key: str) -> int:
+        return sum(
+            1
+            for trade in [*self.active_trades.values(), *self.closed_trades]
+            if trade.get("thesis") == "Opening Top Gainer/Loser Option Buyer"
+            and _trade_date_key(trade, "entryTime", "openedAt") == date_key
+        )
+
+    @staticmethod
+    def _opening_mover_score(candidate: dict[str, Any], quote: dict[str, Any], previous_close: float) -> float:
+        move = abs(_to_float(candidate.get("percentChange")) or 0)
+        open_price = _to_float(candidate.get("open"))
+        gap_pct = abs(((open_price - previous_close) / previous_close) * 100) if open_price is not None and previous_close else 0
+        volume_score = min((_to_float(quote.get("volume")) or 0) / 50000, 25)
+        oi_score = min((_to_float(quote.get("oi")) or 0) / 5000, 40)
+        oi_change_score = min(max(_to_float(quote.get("oiChange")) or 0, 0) / 2000, 60)
+        spread_penalty = min((_to_float(quote.get("spreadPct")) or 0) * 2, 30)
+        return (move * 5) + (gap_pct * 5) + volume_score + oi_score + oi_change_score - spread_penalty
 
     @staticmethod
     def _opening_mover_liquidity_status(quote: dict[str, Any], lot_size: int) -> tuple[bool, str]:
@@ -1983,6 +2289,9 @@ class NiftyOptionsPaperEngine:
             return False, "Waiting for Upstox stock option LTP."
         if lot_size <= 0:
             return False, "Stock option lot size unavailable."
+        oi = _to_float(quote.get("oi"))
+        if oi is None or oi <= 0:
+            return False, "Waiting for Upstox stock option OI."
         return True, "Opening stock option quote OK."
 
     def _waiting_idea(
@@ -2078,26 +2387,40 @@ class NiftyOptionsPaperEngine:
         return 0 <= now - stamp <= NIFTY_OPTIONS_IDEA_RETENTION_SECONDS
 
     def _activate_ideas(self, ideas: list[dict[str, Any]]) -> None:
-        placed = 0
+        index_placed = 0
+        opening_placed = self._opening_mover_trade_count(_today_key())
         for idea in ideas:
-            if placed >= max(1, NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH):
-                if idea.get("ready"):
-                    idea["ready"] = False
-                    idea["status"] = "Ready but another higher-ranked options setup was placed this refresh."
-                continue
             if not idea.get("ready"):
+                continue
+            if idea.get("thesis") == "Opening Top Gainer/Loser Option Buyer":
+                if opening_placed >= max(1, OPENING_MOVER_OPTIONS_MAX_TRADES):
+                    idea["ready"] = False
+                    idea["status"] = f"Ready but opening mover max trades reached ({OPENING_MOVER_OPTIONS_MAX_TRADES})."
+                    continue
+                required_capital = _to_float(idea.get("allocation")) or 0
+                if required_capital and self.snapshot()["availableCapital"] < required_capital:
+                    idea["ready"] = False
+                    idea["status"] = "Ready but options capital is fully allocated."
+                    continue
+            elif index_placed >= max(1, NIFTY_OPTIONS_MAX_NEW_TRADES_PER_REFRESH):
+                idea["ready"] = False
+                idea["status"] = "Ready but another higher-ranked options setup was placed this refresh."
                 continue
             trade = self._trade_from_idea(idea)
             self.active_trades[trade["key"]] = trade
             self.used_confirmations[str(idea.get("confirmationKey") or "")] = int(_to_float(idea.get("confirmationBucket")) or 0)
             idea["status"] = "Options paper trade placed."
             idea["ready"] = False
-            placed += 1
+            if trade.get("thesis") == "Opening Top Gainer/Loser Option Buyer":
+                opening_placed += 1
+            else:
+                index_placed += 1
 
     def _trade_from_idea(self, idea: dict[str, Any]) -> dict[str, Any]:
         trade_id = f"OPT{self.next_trade_id:04d}"
         self.next_trade_id += 1
         entry_time = _now_label()
+        entry_price = _to_float(idea.get("entry"))
         return {
             "id": trade_id,
             "key": self._trade_key(idea),
@@ -2116,11 +2439,27 @@ class NiftyOptionsPaperEngine:
             "stopLoss": idea["stopLoss"],
             "initialStopLoss": idea["stopLoss"],
             "target": idea["target"],
+            "highSinceEntry": _round_price(entry_price),
+            "lowSinceEntry": _round_price(entry_price),
+            "highSinceEntryAt": entry_time,
+            "lowSinceEntryAt": entry_time,
+            "maxFavorablePrice": _round_price(entry_price),
+            "maxAdversePrice": _round_price(entry_price),
+            "maxFavorablePct": 0.0 if entry_price is not None else None,
+            "maxAdversePct": 0.0 if entry_price is not None else None,
             "lots": idea["lots"],
             "lotSize": idea["lotSize"],
             "quantity": idea["quantity"],
             "allocation": _to_float(idea.get("allocation")) or self.trade_allocation,
             "unrealizedPnl": 0.0,
+            "bid": idea.get("bid"),
+            "ask": idea.get("ask"),
+            "spreadPct": idea.get("spreadPct"),
+            "volume": idea.get("volume"),
+            "oi": idea.get("oi"),
+            "prevOi": idea.get("prevOi"),
+            "oiChange": idea.get("oiChange"),
+            "oiChangePct": idea.get("oiChangePct"),
             "confirmationKey": idea.get("confirmationKey"),
             "confirmationBucket": idea.get("confirmationBucket"),
             "entrySpot": idea.get("spot"),
@@ -2158,17 +2497,42 @@ class NiftyOptionsPaperEngine:
             return
         trade["currentPrice"] = _round_price(price)
         trade["unrealizedPnl"] = _round_price(_long_pnl(trade["entry"], price, trade["quantity"]))
+        self._update_option_extremes(trade, price)
         trade["bid"] = quote.get("bid")
         trade["ask"] = quote.get("ask")
         trade["spreadPct"] = quote.get("spreadPct")
         trade["volume"] = quote.get("volume")
         trade["oi"] = quote.get("oi")
+        trade["prevOi"] = quote.get("prevOi")
+        trade["oiChange"] = quote.get("oiChange")
+        trade["oiChangePct"] = _round_price(_to_float(quote.get("oiChangePct")))
         trade["quoteError"] = None
 
     @staticmethod
     def _max_hold_due(trade: dict[str, Any], now: float | None = None) -> bool:
         max_exit = _to_float(trade.get("maxExitTimestamp"))
         return bool(max_exit and (now or time.time()) >= max_exit)
+
+    @staticmethod
+    def _update_option_extremes(trade: dict[str, Any], price: float) -> None:
+        entry = _to_float(trade.get("entry"))
+        if entry is None or entry <= 0:
+            return
+        high = _to_float(trade.get("highSinceEntry"))
+        low = _to_float(trade.get("lowSinceEntry"))
+        now_label = _now_label()
+        if high is None or price > high:
+            trade["highSinceEntry"] = _round_price(price)
+            trade["highSinceEntryAt"] = now_label
+        if low is None or price < low:
+            trade["lowSinceEntry"] = _round_price(price)
+            trade["lowSinceEntryAt"] = now_label
+        high = _to_float(trade.get("highSinceEntry"))
+        low = _to_float(trade.get("lowSinceEntry"))
+        trade["maxFavorablePrice"] = _round_price(high)
+        trade["maxAdversePrice"] = _round_price(low)
+        trade["maxFavorablePct"] = _round_price(((high - entry) / entry) * 100) if high is not None else None
+        trade["maxAdversePct"] = _round_price(((low - entry) / entry) * 100) if low is not None else None
 
     def _square_off_open_trades(self) -> None:
         for key, trade in list(self.active_trades.items()):
@@ -2483,12 +2847,33 @@ class NiftyOptionsPaperEngine:
             trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
             trade["openedAt"] = trade["entryTime"]
             trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+            self._normalize_option_extremes(trade)
         for trade in self.closed_trades:
             trade["entryTime"] = trade.get("entryTime") or trade.get("openedAt") or "-"
             trade["openedAt"] = trade["entryTime"]
             trade["exitTime"] = trade.get("exitTime") or trade.get("closedAt") or "-"
             trade["closedAt"] = trade["exitTime"]
             trade["quantity"] = int(_to_float(trade.get("quantity")) or 0)
+            self._normalize_option_extremes(trade)
+
+    @staticmethod
+    def _normalize_option_extremes(trade: dict[str, Any]) -> None:
+        entry = _to_float(trade.get("entry"))
+        current = _to_float(trade.get("currentPrice"))
+        baseline = current if current is not None else entry
+        if baseline is None or entry is None or entry <= 0:
+            return
+        opened_at = trade.get("entryTime") or trade.get("openedAt") or "-"
+        trade["highSinceEntry"] = _round_price(_first_float(trade.get("highSinceEntry"), baseline))
+        trade["lowSinceEntry"] = _round_price(_first_float(trade.get("lowSinceEntry"), baseline))
+        trade["highSinceEntryAt"] = trade.get("highSinceEntryAt") or opened_at
+        trade["lowSinceEntryAt"] = trade.get("lowSinceEntryAt") or opened_at
+        high = _to_float(trade.get("highSinceEntry"))
+        low = _to_float(trade.get("lowSinceEntry"))
+        trade["maxFavorablePrice"] = _round_price(_first_float(trade.get("maxFavorablePrice"), high))
+        trade["maxAdversePrice"] = _round_price(_first_float(trade.get("maxAdversePrice"), low))
+        trade["maxFavorablePct"] = _round_price(((high - entry) / entry) * 100) if high is not None else None
+        trade["maxAdversePct"] = _round_price(((low - entry) / entry) * 100) if low is not None else None
 
     def _next_trade_id_from_history(self) -> int:
         max_id = 0
@@ -2524,6 +2909,8 @@ class NiftyOptionsPaperEngine:
                 "entryWindowSeconds": OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS,
                 "maxHoldMinutes": OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES,
                 "lots": 1,
+                "topCountPerSide": OPENING_MOVER_OPTIONS_TOP_COUNT,
+                "maxTrades": OPENING_MOVER_OPTIONS_MAX_TRADES,
                 "stopLossPct": OPENING_MOVER_OPTIONS_SL_PCT * 100,
                 "targetMultiple": OPENING_MOVER_OPTIONS_TARGET_MULTIPLE,
             },
@@ -3165,6 +3552,42 @@ class UpstoxPriceStreamer:
             self.previous_m15_close_cache[clean_key] = (now, result)
         return result
 
+    def historical_candles(
+        self,
+        instrument_key: str,
+        unit: str,
+        interval: int,
+        from_date: dt.date,
+        to_date: dt.date,
+    ) -> list[dict[str, Any]]:
+        clean_key = str(instrument_key or "").strip()
+        if not clean_key:
+            return []
+        if unit == "minutes" and (to_date - from_date).days > 25:
+            rows = []
+            chunk_start = from_date
+            while chunk_start <= to_date:
+                chunk_end = min(to_date, chunk_start + dt.timedelta(days=25))
+                rows.extend(self.historical_candles(clean_key, unit, interval, chunk_start, chunk_end))
+                chunk_start = chunk_end + dt.timedelta(days=1)
+            deduped = {str(row.get("timestamp")): row for row in rows if row.get("timestamp")}
+            return sorted(deduped.values(), key=lambda row: row["datetime"])
+        encoded = parse.quote(clean_key, safe="")
+        base_v3 = UPSTOX_API_BASE_URL.replace("/v2", "/v3")
+        req = request.Request(
+            f"{base_v3}/historical-candle/{encoded}/{unit}/{interval}/{to_date.isoformat()}/{from_date.isoformat()}",
+            headers=self._headers(),
+        )
+        with self._urlopen_with_transient_retry(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        candles = (payload.get("data") or {}).get("candles") if isinstance(payload, dict) else []
+        if not isinstance(candles, list):
+            return []
+        parsed = [_candle_row(candle) for candle in candles]
+        rows = [row for row in parsed if row]
+        rows.sort(key=lambda row: row["datetime"])
+        return rows
+
     def update_targets(self, stocks: list[dict[str, Any]]) -> None:
         if not self.enabled:
             return
@@ -3641,6 +4064,24 @@ class UpstoxPriceStreamer:
         if percent_change is None and change is not None and previous_close:
             percent_change = (change / previous_close) * 100
         spread_pct = ((ask - bid) / ltp) * 100 if bid and ask and ltp else None
+        oi = _first_float(market.get("oi"), market.get("open_interest"), market.get("openInterest"))
+        prev_oi = _first_float(market.get("prev_oi"), market.get("prevOi"), market.get("previous_oi"), market.get("previousOi"))
+        oi_change = _first_float(
+            market.get("oi_change"),
+            market.get("oiChange"),
+            market.get("open_interest_change"),
+            market.get("openInterestChange"),
+        )
+        if oi_change is None and oi is not None and prev_oi is not None:
+            oi_change = oi - prev_oi
+        oi_change_pct = _first_float(
+            market.get("oi_change_pct"),
+            market.get("oiChangePct"),
+            market.get("open_interest_change_pct"),
+            market.get("openInterestChangePct"),
+        )
+        if oi_change_pct is None and oi_change is not None and prev_oi:
+            oi_change_pct = (oi_change / prev_oi) * 100
         return {
             "ltp": ltp,
             "change": change,
@@ -3650,7 +4091,10 @@ class UpstoxPriceStreamer:
             "ask": _round_price(ask),
             "spreadPct": round(spread_pct, 2) if spread_pct is not None else None,
             "volume": _first_float(market.get("volume"), market.get("volume_traded"), market.get("total_volume")),
-            "oi": _first_float(market.get("oi"), market.get("open_interest"), market.get("openInterest")),
+            "oi": oi,
+            "prevOi": prev_oi,
+            "oiChange": oi_change,
+            "oiChangePct": oi_change_pct,
             "iv": _first_float(greeks.get("iv"), greeks.get("implied_volatility"), greeks.get("impliedVolatility")),
         }
 
@@ -3889,9 +4333,10 @@ class NSEStreamer:
             return
         with self.paper_lock:
             active_targets = self.paper_engine.active_mark_targets()
+            closing_volume_targets = self.paper_engine.closing_volume_mark_targets()
         with self.lock:
             stock_groups = list(self.state.sector_stock_groups)
-        self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, active_targets))
+        self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, {**active_targets, **closing_volume_targets}))
 
     def _overlay_stream_prices_locked(self, ticks: list[dict[str, Any]]) -> None:
         by_symbol = {str(tick.get("symbol") or "").upper(): tick for tick in ticks}
@@ -4014,20 +4459,22 @@ class NSEStreamer:
             stock_groups = self._fetch_sector_stock_groups(parsed["sector_rows"])
             with self.paper_lock:
                 active_targets = self.paper_engine.active_mark_targets()
+                closing_volume_targets = self.paper_engine.closing_volume_mark_targets()
+            mark_targets = {**active_targets, **closing_volume_targets}
             websocket_allowed = bool(market_clock.get("shouldStream"))
             self.price_streamer.set_stream_allowed(websocket_allowed, str(market_clock.get("reason") or "market clock"))
             if USE_UPSTOX_PRICE_DATA:
-                price_targets = self._price_stream_targets(stock_groups, active_targets)
+                price_targets = self._price_stream_targets(stock_groups, mark_targets)
                 upstox_marks = self.price_streamer.quote_stocks(price_targets)
                 stock_groups = self._apply_price_targets_to_groups(stock_groups, upstox_marks)
                 active_quote_stocks = [
                     stock for stock in upstox_marks
-                    if str(stock.get("symbol") or "").strip().upper() in {symbol.upper() for symbol in active_targets}
+                    if str(stock.get("symbol") or "").strip().upper() in {symbol.upper() for symbol in mark_targets}
                 ]
             else:
-                active_quote_stocks = self._fetch_active_trade_marks(active_targets, stock_groups)
+                active_quote_stocks = self._fetch_active_trade_marks(mark_targets, stock_groups)
             if websocket_allowed:
-                self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, active_targets))
+                self.price_streamer.update_targets(self._stream_subscription_targets(stock_groups, mark_targets))
             else:
                 self.price_streamer.update_targets([])
             with self.paper_lock:
@@ -4078,6 +4525,7 @@ class NSEStreamer:
             self.app_log.warn("Market refresh failed", error=str(exc))
 
     def _set_market_clock(self, clock: dict[str, Any]) -> None:
+        self._maybe_refresh_closing_volume_shortlist(clock)
         with self.paper_lock:
             paper_trading = self.paper_engine.snapshot()
             options_paper = self.options_engine.snapshot()
@@ -4088,6 +4536,160 @@ class NSEStreamer:
             self.state.paper_trading = paper_trading
             self.state.options_paper_trading = options_paper
             self.state.price_streaming = self.price_streamer.status()
+
+    def _maybe_refresh_closing_volume_shortlist(self, clock: dict[str, Any]) -> None:
+        if not USE_UPSTOX_PRICE_DATA:
+            return
+        now = dt.datetime.now()
+        if bool(clock.get("shouldStream")) or now.time() <= MARKET_CLOSE_TIME:
+            return
+        session_date = self._last_trading_date(now.date())
+        target_date = self._next_trading_date(session_date + dt.timedelta(days=1))
+        with self.paper_lock:
+            current_source = self.paper_engine.closing_volume_shortlist.get("sourceDate")
+            current_universe = self.paper_engine.closing_volume_shortlist.get("universe")
+            current_spike = _to_float(self.paper_engine.closing_volume_shortlist.get("spikeMultiple"))
+        if (
+            current_source == _date_key(session_date)
+            and current_universe == CLOSING_VOLUME_UNIVERSE
+            and current_spike == CLOSING_VOLUME_SPIKE_MULTIPLE
+        ):
+            return
+        try:
+            shortlist = self.generate_closing_volume_shortlist(session_date, target_date)
+            with self.paper_lock:
+                self.paper_engine.set_closing_volume_shortlist(shortlist)
+            self.app_log.info(
+                "Closing volume shortlist generated",
+                sourceDate=shortlist.get("sourceDate"),
+                targetDate=shortlist.get("targetDate"),
+                selected=len(shortlist.get("selected") or []),
+            )
+        except Exception as exc:  # noqa: BLE001 - shortlist failure must not stop dashboard clock/status
+            self.app_log.warn("Closing volume shortlist generation failed", error=str(exc))
+
+    def generate_closing_volume_shortlist(
+        self,
+        session_date: dt.date | None = None,
+        target_date: dt.date | None = None,
+    ) -> dict[str, Any]:
+        session_date = session_date or self._last_trading_date(dt.date.today())
+        target_date = target_date or self._next_trading_date(session_date + dt.timedelta(days=1))
+        payload = self.client.fetch_sector_stocks(CLOSING_VOLUME_UNIVERSE)
+        universe = self._parse_sector_stocks(payload, CLOSING_VOLUME_UNIVERSE, "closing")
+        symbols = [str(stock.get("symbol") or "").strip().upper() for stock in universe if stock.get("symbol")]
+        resolved = self.price_streamer.resolver.resolve(symbols) if self.price_streamer.resolver else {}
+        selected = []
+        errors = []
+        for symbol in symbols:
+            instrument_key = resolved.get(symbol)
+            if not instrument_key:
+                errors.append({"symbol": symbol, "error": "Upstox instrument key missing"})
+                continue
+            try:
+                candidate = self._closing_volume_candidate(symbol, instrument_key, session_date, target_date)
+            except Exception as exc:  # noqa: BLE001 - one symbol should not block the full shortlist
+                errors.append({"symbol": symbol, "error": str(exc)})
+                continue
+            if candidate:
+                selected.append(candidate)
+
+        bullish = sorted([row for row in selected if row.get("side") == "BUY"], key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
+        bearish = sorted([row for row in selected if row.get("side") == "SHORT"], key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
+        final_rows = bullish[:CLOSING_VOLUME_TOP_COUNT] + bearish[:CLOSING_VOLUME_TOP_COUNT]
+        final_rows.sort(key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
+        return {
+            "sourceDate": _date_key(session_date),
+            "targetDate": _date_key(target_date),
+            "generatedAt": _now_label(),
+            "universe": CLOSING_VOLUME_UNIVERSE,
+            "lookbackDays": CLOSING_VOLUME_LOOKBACK_DAYS,
+            "topCountPerSide": CLOSING_VOLUME_TOP_COUNT,
+            "spikeMultiple": CLOSING_VOLUME_SPIKE_MULTIPLE,
+            "minDailyVolumePct": CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT * 100,
+            "minBodyPct": CLOSING_VOLUME_MIN_BODY_PCT * 100,
+            "selected": final_rows,
+            "eligibleCount": len(selected),
+            "errorCount": len(errors),
+            "errors": errors[:12],
+        }
+
+    def _closing_volume_candidate(
+        self,
+        symbol: str,
+        instrument_key: str,
+        session_date: dt.date,
+        target_date: dt.date,
+    ) -> dict[str, Any] | None:
+        lookback_calendar_days = max(45, CLOSING_VOLUME_LOOKBACK_DAYS * 3)
+        from_date = session_date - dt.timedelta(days=lookback_calendar_days)
+        candles_15m = self.price_streamer.historical_candles(instrument_key, "minutes", 15, from_date, session_date)
+        daily = self.price_streamer.historical_candles(instrument_key, "days", 1, from_date, session_date)
+        session_candles = [row for row in candles_15m if row.get("date") == session_date]
+        if not session_candles:
+            return None
+        final15 = max(session_candles, key=lambda row: row["datetime"])
+        final_open = _to_float(final15.get("open"))
+        final_close = _to_float(final15.get("close"))
+        final_high = _to_float(final15.get("high"))
+        final_low = _to_float(final15.get("low"))
+        final_volume = _to_float(final15.get("volume"))
+        if final_open is None or final_close is None or final_high is None or final_low is None or final_volume is None or final_open <= 0:
+            return None
+        if final_close == final_open:
+            return None
+        side = "BUY" if final_close > final_open else "SHORT"
+        body_pct = abs(final_close - final_open) / final_open
+        if body_pct < CLOSING_VOLUME_MIN_BODY_PCT:
+            return None
+
+        final_by_date: dict[dt.date, dict[str, Any]] = {}
+        for row in candles_15m:
+            row_date = row.get("date")
+            if not isinstance(row_date, dt.date) or row_date >= session_date:
+                continue
+            current = final_by_date.get(row_date)
+            if current is None or row["datetime"] > current["datetime"]:
+                final_by_date[row_date] = row
+        final_volumes = [
+            _to_float(row.get("volume")) or 0
+            for _, row in sorted(final_by_date.items(), reverse=True)[:CLOSING_VOLUME_LOOKBACK_DAYS]
+        ]
+        final_volumes = [volume for volume in final_volumes if volume > 0]
+        daily_volumes = [
+            _to_float(row.get("volume")) or 0
+            for row in daily
+            if isinstance(row.get("date"), dt.date) and row["date"] < session_date
+        ][-CLOSING_VOLUME_LOOKBACK_DAYS:]
+        daily_volumes = [volume for volume in daily_volumes if volume > 0]
+        if not final_volumes or not daily_volumes:
+            return None
+        avg_final15 = sum(final_volumes) / len(final_volumes)
+        avg_daily = sum(daily_volumes) / len(daily_volumes)
+        volume_spike = final_volume / avg_final15 if avg_final15 else 0
+        daily_share = final_volume / avg_daily if avg_daily else 0
+        if volume_spike < CLOSING_VOLUME_SPIKE_MULTIPLE or daily_share < CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT:
+            return None
+        score = (volume_spike * 50) + (daily_share * 200) + (body_pct * 1000)
+        return {
+            "symbol": symbol,
+            "side": side,
+            "sessionDate": _date_key(session_date),
+            "targetDate": _date_key(target_date),
+            "instrumentKey": instrument_key,
+            "final15Start": final15.get("datetime").strftime("%Y-%m-%d %H:%M:%S"),
+            "final15Open": _round_price(final_open),
+            "final15High": _round_price(final_high),
+            "final15Low": _round_price(final_low),
+            "final15Close": _round_price(final_close),
+            "final15Volume": int(final_volume),
+            "avgFinal15Volume": int(avg_final15),
+            "avgDailyVolume": int(avg_daily),
+            "volumeSpike": round(volume_spike, 2),
+            "dailyVolumeSharePct": round(daily_share * 100, 2),
+            "final15BodyPct": round(body_pct * 100, 2),
+            "score": round(score, 2),
+        }
 
     def _market_clock(self, force: bool = False) -> dict[str, Any]:
         today = dt.datetime.now().date()
@@ -4177,6 +4779,24 @@ class NSEStreamer:
             date_key = _date_key(candidate.date())
             holidays = self.holiday_cache.get(candidate.year, {})
             if candidate.weekday() < 5 and date_key not in holidays:
+                return candidate
+            candidate += dt.timedelta(days=1)
+
+    def _last_trading_date(self, start_date: dt.date) -> dt.date:
+        candidate = start_date
+        while True:
+            self._refresh_market_reference(candidate)
+            holidays = self.holiday_cache.get(candidate.year, {})
+            if candidate.weekday() < 5 and _date_key(candidate) not in holidays:
+                return candidate
+            candidate -= dt.timedelta(days=1)
+
+    def _next_trading_date(self, start_date: dt.date) -> dt.date:
+        candidate = start_date
+        while True:
+            self._refresh_market_reference(candidate)
+            holidays = self.holiday_cache.get(candidate.year, {})
+            if candidate.weekday() < 5 and _date_key(candidate) not in holidays:
                 return candidate
             candidate += dt.timedelta(days=1)
 

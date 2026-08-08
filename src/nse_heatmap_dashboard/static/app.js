@@ -393,6 +393,8 @@ function renderPaperTrading(paper) {
   const ideas = data.ideas || [];
   const activeTrades = data.openTrades || data.activeTrades || [];
   const closedTrades = data.closedTrades || [];
+  const closingVolume = data.closingVolumeShortlist || {};
+  const closingRows = closingVolume.selected || [];
 
   q("#p-initial").textContent = fmt(data.initialCapital, 0);
   q("#p-available").textContent = fmt(data.availableCapital, 0);
@@ -409,6 +411,9 @@ function renderPaperTrading(paper) {
   q("#p-saved").className = data.persistenceError ? "bad" : "";
   q("#p-idea-count").textContent = data.sessionOpen ? `${ideas.length} ideas` : data.sessionStatus || "Waiting for session";
   q("#p-closed-count").textContent = `${data.closedCount || 0} closed`;
+  q("#closing-volume-status").textContent = closingVolume.sourceDate
+    ? `${closingVolume.sourceDate} -> ${closingVolume.targetDate || "-"} / ${closingRows.length} stocks`
+    : "No shortlist";
 
   q("#paper-ideas-body").innerHTML = data.persistenceError ? `<tr><td colspan="11" class="empty-state bad">${safe(data.persistenceError)}</td></tr>` : ideas.length ? ideas.map((idea) => `
     <tr class="${idea.ready ? "ready-row" : ""}">
@@ -431,6 +436,30 @@ function renderPaperTrading(paper) {
       <td><span class="status-pill ${idea.ready ? "ready" : ""}">${safe(idea.status)}</span></td>
     </tr>
   `).join("") : `<tr><td colspan="11" class="empty-state">${safe(data.sessionStatus || "Waiting for selected stocks and M5 candles.")}</td></tr>`;
+
+  q("#closing-volume-body").innerHTML = closingRows.length ? closingRows.map((row) => `
+    <tr>
+      <td>
+        <strong>${safe(row.symbol)}</strong>
+        <span>${safe(row.sessionDate || "-")} -> ${safe(row.targetDate || "-")}</span>
+      </td>
+      <td class="${tradeSideClass(row.side)}">${safe(row.side)}</td>
+      <td>
+        O ${fmtMaybe(row.final15Open)} C ${fmtMaybe(row.final15Close)}
+        <span>${fmtMaybe(row.final15BodyPct)}% body</span>
+      </td>
+      <td>
+        ${fmtMaybe(row.final15Volume, 0)}
+        <span>${fmtMaybe(row.dailyVolumeSharePct)}% of avg day</span>
+      </td>
+      <td>${fmtMaybe(row.avgDailyVolume, 0)}</td>
+      <td>
+        ${fmtMaybe(row.avgFinal15Volume, 0)}
+        <span>${fmtMaybe(row.volumeSpike)}x</span>
+      </td>
+      <td>${fmtMaybe(row.score)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"7\" class=\"empty-state\">No closing-volume shortlist yet.</td></tr>";
 
   q("#active-trades-body").innerHTML = activeTrades.length ? activeTrades.map((trade) => `
     <tr>
@@ -554,7 +583,10 @@ function renderOptionsPaper(options) {
         <td>${fmtMaybe(idea.target)}</td>
         <td>${fmtMaybe(idea.lots, 0)} <span>${fmtMaybe(idea.quantity, 0)} qty</span></td>
         <td>${fmtMaybe(idea.spreadPct)}%</td>
-        <td>${fmtMaybe(idea.volume, 0)} / ${fmtMaybe(idea.oi, 0)}</td>
+        <td>
+          ${fmtMaybe(idea.volume, 0)} / ${fmtMaybe(idea.oi, 0)}
+          <span>OI chg ${fmtMaybe(idea.oiChange, 0)} (${fmtMaybe(idea.oiChangePct)}%)</span>
+        </td>
         <td class="idea-status-cell"><span class="status-pill ${idea.ready ? "ready" : idea.stale ? "stale" : ""}">${safe(compactIdeaStatus(idea))}</span></td>
       </tr>
     `).join("")
@@ -578,12 +610,16 @@ function renderOptionsPaper(options) {
       <td>${fmt(trade.quantity, 0)}</td>
       <td class="${changeClass(trade.unrealizedPnl)}">${fmt(trade.unrealizedPnl)}</td>
       <td>
+        H ${fmtMaybe(trade.highSinceEntry)}
+        <span>L ${fmtMaybe(trade.lowSinceEntry)} / ${fmtMaybe(trade.maxFavorablePct)}% ${fmtMaybe(trade.maxAdversePct)}%</span>
+      </td>
+      <td>
         ${fmt(trade.spreadPct)}%
-        <span>${fmt(trade.volume, 0)} / ${fmt(trade.oi, 0)}</span>
+        <span>${fmt(trade.volume, 0)} / ${fmt(trade.oi, 0)} | OI chg ${fmtMaybe(trade.oiChange, 0)}</span>
       </td>
       <td><button class="close-options-trade-btn danger" type="button" data-trade-id="${safe(trade.id)}">Close</button></td>
     </tr>
-  `).join("") : "<tr><td colspan=\"11\" class=\"empty-state\">No active options paper trades yet.</td></tr>";
+  `).join("") : "<tr><td colspan=\"12\" class=\"empty-state\">No active options paper trades yet.</td></tr>";
 
   q("#options-closed-body").innerHTML = closedTrades.length ? closedTrades.map((trade) => `
     <tr>
@@ -595,9 +631,13 @@ function renderOptionsPaper(options) {
       <td>${safe(trade.exitTime || trade.closedAt)}</td>
       <td>${fmt(trade.entry)}</td>
       <td>${fmt(trade.exitPrice)}</td>
+      <td>
+        H ${fmtMaybe(trade.highSinceEntry)}
+        <span>L ${fmtMaybe(trade.lowSinceEntry)} / ${fmtMaybe(trade.maxFavorablePct)}% ${fmtMaybe(trade.maxAdversePct)}%</span>
+      </td>
       <td class="${changeClass(trade.realizedPnl)}">${fmt(trade.realizedPnl)}</td>
     </tr>
-  `).join("") : "<tr><td colspan=\"9\" class=\"empty-state\">No closed options paper trades yet.</td></tr>";
+  `).join("") : "<tr><td colspan=\"10\" class=\"empty-state\">No closed options paper trades yet.</td></tr>";
 }
 
 function renderPaperTradesIndex(paper) {

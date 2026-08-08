@@ -172,6 +172,23 @@
 
       <div class="panel paper-panel">
         <div class="panel-head">
+          <h2>Closing Volume Shortlist</h2>
+          <span id="closing-volume-status">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Stock</th><th>Side</th><th>Final 15m</th><th>Volume</th><th>Avg Daily</th><th>Avg Final 15m</th><th>Score</th>
+              </tr>
+            </thead>
+            <tbody id="closing-volume-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
           <h2>Active Trades</h2>
           <span>50,000 allocation</span>
         </div>
@@ -245,7 +262,7 @@
           <table>
             <thead>
               <tr>
-                <th>Trade</th><th>Contract</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Qty</th><th>P/L</th><th>Liquidity</th><th>Action</th>
+                <th>Trade</th><th>Contract</th><th>Entry Time</th><th>Entry</th><th>Current</th><th>SL</th><th>TP</th><th>Qty</th><th>P/L</th><th>Range</th><th>Liquidity</th><th>Action</th>
               </tr>
             </thead>
             <tbody id="options-active-body"></tbody>
@@ -262,7 +279,7 @@
           <table>
             <thead>
               <tr>
-                <th>Trade</th><th>Contract</th><th>Exit</th><th>Qty</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit Price</th><th>Realized P/L</th>
+                <th>Trade</th><th>Contract</th><th>Exit</th><th>Qty</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit Price</th><th>Range</th><th>Realized P/L</th>
               </tr>
             </thead>
             <tbody id="options-closed-body"></tbody>
