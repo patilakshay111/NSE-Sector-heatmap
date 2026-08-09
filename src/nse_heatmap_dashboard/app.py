@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import csv
 from collections import deque
 from dataclasses import dataclass, field
 import datetime as dt
 from http import cookiejar
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import socket
@@ -14,12 +16,14 @@ import time
 from typing import Any
 from urllib import error, parse, request
 import webbrowser
+import zipfile
 
 from .config import (
     BUY_SECTOR_THRESHOLD,
     CLOSING_VOLUME_ENTRY_WINDOW_MINUTES,
     CLOSING_VOLUME_LOOKBACK_DAYS,
     CLOSING_VOLUME_MAX_RISK_PCT,
+    CLOSING_VOLUME_MAX_TRADES,
     CLOSING_VOLUME_MIN_BODY_PCT,
     CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT,
     CLOSING_VOLUME_SPIKE_MULTIPLE,
@@ -478,6 +482,7 @@ class PaperTradingEngine:
             for row in rows
             if str(row.get("symbol") or "").strip()
             and (_to_float(row.get("volumeSpike")) or 0) >= CLOSING_VOLUME_SPIKE_MULTIPLE
+            and self._closing_volume_row_tradeable(row)
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -710,6 +715,18 @@ class PaperTradingEngine:
     def _daily_stock_sl_limit_reached(self, symbol: str) -> bool:
         return self._daily_stock_sl_count(symbol) >= DAILY_STOCK_SL_LIMIT
 
+    def _daily_thesis_trade_count(self, thesis: str, day_key: str | None = None) -> int:
+        day = _valid_date_key(day_key) or _today_key()
+        clean_thesis = str(thesis or "").strip()
+        if not clean_thesis:
+            return 0
+        return sum(
+            1
+            for trade in [*self.active_trades.values(), *self.closed_trades]
+            if str(trade.get("thesis") or "").strip() == clean_thesis
+            and _trade_date_key(trade, "entryTime", "openedAt") == day
+        )
+
     def _load(self) -> None:
         if not PAPER_STATE_PATH.exists():
             return
@@ -871,6 +888,7 @@ class PaperTradingEngine:
             for row in setup_rows
             if str(row.get("symbol") or "").strip()
             and (_to_float(row.get("volumeSpike")) or 0) >= CLOSING_VOLUME_SPIKE_MULTIPLE
+            and self._closing_volume_row_tradeable(row)
         }
         mark_by_symbol = {
             str(stock.get("symbol") or "").strip().upper(): stock
@@ -892,6 +910,15 @@ class PaperTradingEngine:
                 }
             )
         return stocks
+
+    @staticmethod
+    def _closing_volume_row_tradeable(row: dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        decision = str(row.get("trendDecision") or "").strip().upper()
+        if decision:
+            return decision == "KEEP"
+        return bool(row.get("tradeable", True))
 
     def _update_candle(self, stock: dict[str, Any], now: float) -> None:
         symbol = stock["symbol"]
@@ -948,6 +975,8 @@ class PaperTradingEngine:
         final_high = _to_float(setup.get("final15High"))
         if not symbol or side not in {"BUY", "SHORT"} or price is None or final_close is None or final_low is None or final_high is None:
             return None
+        if not self._closing_volume_row_tradeable(setup):
+            return None
 
         now_dt = dt.datetime.fromtimestamp(now)
         entry_start = dt.datetime.combine(now_dt.date(), dt.time(PAPER_START_HOUR, PAPER_START_MINUTE))
@@ -985,11 +1014,15 @@ class PaperTradingEngine:
 
         rr = _risk_reward(side, price, stop_loss, target)
         quantity = max(1, int(self.trade_allocation // price)) if price > 0 else 0
+        thesis = "Closing Volume Institutional Followthrough"
+        daily_thesis_count = self._daily_thesis_trade_count(thesis, _date_key(now_dt.date()))
+        thesis_limit_reached = daily_thesis_count >= max(1, CLOSING_VOLUME_MAX_TRADES)
         ready = bool(
             time_ok
             and direction_ok
             and not confirmation_used
             and active_key not in self.active_trades
+            and not thesis_limit_reached
             and rr is not None
             and rr > MIN_TRADE_RR
             and quantity > 0
@@ -998,6 +1031,8 @@ class PaperTradingEngine:
             status = "Already active"
         elif confirmation_used:
             status = "Opening followthrough already traded today"
+        elif thesis_limit_reached:
+            status = f"Opening followthrough max trades reached ({CLOSING_VOLUME_MAX_TRADES})."
         elif time_ok and not direction_ok:
             direction_text = "above" if side == "BUY" else "below"
             status = f"Rejected: open/current is not {direction_text} Friday final 15m close {final_close:.2f}"
@@ -1010,7 +1045,7 @@ class PaperTradingEngine:
             "symbol": symbol,
             "sector": f"Closing Volume {CLOSING_VOLUME_UNIVERSE}",
             "side": side,
-            "thesis": "Closing Volume Institutional Followthrough",
+            "thesis": thesis,
             "thesisDetail": f"After market close, shortlist {CLOSING_VOLUME_UNIVERSE} stocks with institutional-style final 15-minute volume; next session, enter at the open only if price follows that direction.",
             "entry": _round_price(price),
             "stopLoss": _round_price(stop_loss),
@@ -1044,6 +1079,16 @@ class PaperTradingEngine:
             "avgFinal15Volume": setup.get("avgFinal15Volume"),
             "final15Volume": setup.get("final15Volume"),
             "final15BodyPct": setup.get("final15BodyPct"),
+            "deliveryPct": setup.get("deliveryPct"),
+            "deliverableQty": setup.get("deliverableQty"),
+            "tradedQty": setup.get("tradedQty"),
+            "futuresSignal": setup.get("futuresSignal"),
+            "futuresOi": setup.get("futuresOi"),
+            "futuresOiChange": setup.get("futuresOiChange"),
+            "futuresPriceChange": setup.get("futuresPriceChange"),
+            "futuresPriceChangePct": setup.get("futuresPriceChangePct"),
+            "futuresExpiry": setup.get("futuresExpiry"),
+            "institutionRead": setup.get("institutionRead"),
             "openingReference": _round_price(opening_reference),
             "closingVolumeSetup": setup,
         }
@@ -1320,6 +1365,12 @@ class PaperTradingEngine:
             if not idea.get("ready"):
                 continue
             symbol = str(idea.get("symbol") or "")
+            if str(idea.get("thesis") or "") == "Closing Volume Institutional Followthrough":
+                count = self._daily_thesis_trade_count("Closing Volume Institutional Followthrough")
+                if count >= max(1, CLOSING_VOLUME_MAX_TRADES):
+                    idea["ready"] = False
+                    idea["status"] = f"Ready but opening followthrough max trades reached ({CLOSING_VOLUME_MAX_TRADES})."
+                    continue
             if self._daily_stock_sl_limit_reached(symbol):
                 idea["ready"] = False
                 idea["status"] = f"{symbol} daily SL limit reached ({DAILY_STOCK_SL_LIMIT}); no new trades for this stock today"
@@ -1379,6 +1430,16 @@ class PaperTradingEngine:
             "avgFinal15Volume": idea.get("avgFinal15Volume"),
             "final15Volume": idea.get("final15Volume"),
             "final15BodyPct": idea.get("final15BodyPct"),
+            "deliveryPct": idea.get("deliveryPct"),
+            "deliverableQty": idea.get("deliverableQty"),
+            "tradedQty": idea.get("tradedQty"),
+            "futuresSignal": idea.get("futuresSignal"),
+            "futuresOi": idea.get("futuresOi"),
+            "futuresOiChange": idea.get("futuresOiChange"),
+            "futuresPriceChange": idea.get("futuresPriceChange"),
+            "futuresPriceChangePct": idea.get("futuresPriceChangePct"),
+            "futuresExpiry": idea.get("futuresExpiry"),
+            "institutionRead": idea.get("institutionRead"),
             "openingReference": idea.get("openingReference"),
             "closingVolumeSetup": idea.get("closingVolumeSetup"),
             "unrealizedPnl": 0.0,
@@ -2973,6 +3034,22 @@ class NSEClient:
             warm_url=NSE_TOP_GAINERS_LOSERS_URL,
         )
 
+    def fetch_delivery_bhavcopy(self, trade_date: dt.date) -> list[dict[str, str]]:
+        url = f"https://archives.nseindia.com/products/content/sec_bhavdata_full_{trade_date.strftime('%d%m%Y')}.csv"
+        return self._fetch_csv_rows(url, NSE_HOME)
+
+    def fetch_fo_bhavcopy(self, trade_date: dt.date) -> list[dict[str, str]]:
+        stamp = trade_date.strftime("%Y%m%d")
+        filename = f"BhavCopy_NSE_FO_0_0_0_{stamp}_F_0000.csv"
+        url = f"https://nsearchives.nseindia.com/content/fo/{filename}.zip"
+        req = request.Request(url, headers=self._headers(NSE_HOME))
+        with self._open_with_transient_retry(req, timeout=25) as response:
+            payload = response.read()
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            with archive.open(filename) as handle:
+                text = handle.read().decode("utf-8-sig")
+        return self._csv_rows_from_text(text)
+
     def _fetch_with_cookie_retry(
         self,
         url: str,
@@ -3002,6 +3079,19 @@ class NSEClient:
         with self._open_with_transient_retry(req, timeout=15) as response:
             payload = response.read()
         return json.loads(payload.decode("utf-8"))
+
+    def _fetch_csv_rows(self, url: str, referer: str = NSE_HOME) -> list[dict[str, str]]:
+        req = request.Request(url, headers=self._headers(referer))
+        with self._open_with_transient_retry(req, timeout=25) as response:
+            payload = response.read()
+        return self._csv_rows_from_text(payload.decode("utf-8-sig"))
+
+    @staticmethod
+    def _csv_rows_from_text(text: str) -> list[dict[str, str]]:
+        rows = []
+        for row in csv.DictReader(io.StringIO(text)):
+            rows.append({str(key or "").strip(): str(value or "").strip() for key, value in row.items()})
+        return rows
 
     def _open_with_transient_retry(self, req: request.Request, timeout: int):
         last_exc: BaseException | None = None
@@ -3392,6 +3482,7 @@ class UpstoxPriceStreamer:
         self.option_chain_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.option_contract_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.option_expiry_cache: dict[str, tuple[float, list[str]]] = {}
+        self.future_contract_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self.previous_m15_close_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
     def resolve_equity_key(self, symbol: str) -> str | None:
@@ -3493,6 +3584,93 @@ class UpstoxPriceStreamer:
             "dataSource": "Upstox market-quote/quotes",
             "priceIsMock": False,
         }
+
+    def quote_stock_future(self, symbol: str, as_of_date: dt.date | None = None) -> dict[str, Any]:
+        clean_symbol = str(symbol or "").strip().upper()
+        if not clean_symbol or not self.token:
+            return {"symbol": clean_symbol, "futureError": "Upstox token missing for stock futures quote."}
+        contract = self._resolve_stock_future_contract(clean_symbol, as_of_date or dt.date.today())
+        instrument_key = str(contract.get("instrumentKey") or "")
+        if not instrument_key:
+            return {**contract, "symbol": clean_symbol, "futureError": contract.get("futureError") or "No Upstox stock futures contract found."}
+        try:
+            rows = self._fetch_quote_rows([instrument_key])
+        except Exception as exc:  # noqa: BLE001
+            return {**contract, "symbol": clean_symbol, "futureError": str(exc)}
+        row = rows.get(instrument_key) or next((value for value in rows.values() if isinstance(value, dict)), {})
+        if not isinstance(row, dict) or not row:
+            return {**contract, "symbol": clean_symbol, "futureError": "Upstox stock futures quote missing."}
+        price = _first_float(row.get("last_price"), row.get("ltp"), row.get("lastPrice"))
+        previous_close = _first_float(row.get("close"), (row.get("ohlc") or {}).get("close") if isinstance(row.get("ohlc"), dict) else None)
+        price_change = _first_float(row.get("net_change"), row.get("netChange"), row.get("change"))
+        if price_change is None and price is not None and previous_close:
+            price_change = price - previous_close
+        price_change_pct = (price_change / previous_close) * 100 if price_change is not None and previous_close else None
+        return {
+            **contract,
+            "symbol": clean_symbol,
+            "futuresClose": _round_price(price),
+            "futuresPriceChange": _round_price(price_change),
+            "futuresPriceChangePct": _round_price(price_change_pct),
+            "futuresOi": int(_to_float(row.get("oi")) or 0),
+            "futuresVolume": int(_to_float(row.get("volume")) or 0),
+            "futuresOiDayHigh": int(_to_float(row.get("oi_day_high")) or 0),
+            "futuresOiDayLow": int(_to_float(row.get("oi_day_low")) or 0),
+            "futuresDataSource": "Upstox market-quote/quotes",
+            "futureError": None,
+        }
+
+    def _resolve_stock_future_contract(self, symbol: str, as_of_date: dt.date) -> dict[str, Any]:
+        now = time.time()
+        cache_key = f"{symbol}|{_date_key(as_of_date)}"
+        with self.lock:
+            cached = self.future_contract_cache.get(cache_key)
+            if cached and now - cached[0] <= 300:
+                return cached[1]
+        params = parse.urlencode(
+            {
+                "query": symbol,
+                "exchanges": "NSE",
+                "segments": "FO",
+                "page_number": "1",
+                "records": "50",
+            }
+        )
+        req = request.Request(f"{UPSTOX_API_BASE_URL}/instruments/search?{params}", headers=self._headers())
+        try:
+            with self._urlopen_with_transient_retry(req, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            return {"futureError": str(exc)}
+        rows = payload.get("data") if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            rows = []
+        futures = [
+            row for row in rows
+            if isinstance(row, dict)
+            and str(row.get("segment") or "").upper() == "NSE_FO"
+            and str(row.get("instrument_type") or "").upper() == "FUT"
+            and str(row.get("trading_symbol") or "").upper().startswith(f"{symbol} FUT ")
+        ]
+        dated = []
+        for row in futures:
+            expiry = _parse_nse_date(row.get("expiry"))
+            if expiry:
+                dated.append((expiry, row))
+        future_expiries = sorted((item for item in dated if item[0] >= as_of_date), key=lambda item: item[0])
+        selected = future_expiries[0][1] if future_expiries else sorted(dated, key=lambda item: item[0])[-1][1] if dated else None
+        if not selected:
+            result = {"futureError": "No Upstox stock futures contract found."}
+        else:
+            result = {
+                "futuresInstrumentKey": selected.get("instrument_key") or selected.get("instrumentKey"),
+                "futuresTradingSymbol": selected.get("trading_symbol") or selected.get("tradingSymbol"),
+                "futuresExpiry": selected.get("expiry"),
+                "futuresLotSize": int(_to_float(selected.get("lot_size") or selected.get("lotSize")) or 0),
+            }
+        with self.lock:
+            self.future_contract_cache[cache_key] = (now, result)
+        return result
 
     def previous_m15_close(self, symbol: str, instrument_key: str) -> dict[str, Any]:
         clean_key = str(instrument_key or "").strip()
@@ -4218,6 +4396,7 @@ class FeedState:
     paper_trading: dict[str, Any] = field(default_factory=dict)
     options_paper_trading: dict[str, Any] = field(default_factory=dict)
     price_streaming: dict[str, Any] = field(default_factory=dict)
+    closing_volume_scan: dict[str, Any] = field(default_factory=dict)
     max_gainer: dict[str, Any] | None = None
     max_loser: dict[str, Any] | None = None
     top_movers: dict[str, Any] = field(default_factory=dict)
@@ -4240,6 +4419,7 @@ class NSEStreamer:
         self.state = FeedState()
         self.lock = threading.RLock()
         self.paper_lock = threading.RLock()
+        self.closing_scan_lock = threading.RLock()
         self.holiday_cache: dict[int, dict[str, str]] = {}
         self.holiday_loaded_at = 0.0
         self.holiday_error: str | None = None
@@ -4248,6 +4428,7 @@ class NSEStreamer:
         self.market_status_error: str | None = None
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.closing_scan_thread: threading.Thread | None = None
         self.app_log.info("Dashboard initialized", priceDataProvider=PRICE_DATA_PROVIDER)
 
     def start(self) -> bool:
@@ -4275,6 +4456,75 @@ class NSEStreamer:
     def refresh_once(self) -> dict[str, Any]:
         self._fetch_and_store(force=True)
         return self.status()
+
+    def trigger_closing_volume_scan(self) -> dict[str, Any]:
+        clock = self._market_clock()
+        if not bool(clock.get("afterMarketClose")):
+            return {
+                "ok": False,
+                "error": f"Closing volume scan is enabled only after {clock.get('marketCloseTime') or 'market close'}.",
+                "status": self.status(),
+            }
+        with self.closing_scan_lock:
+            if self.closing_scan_thread and self.closing_scan_thread.is_alive():
+                return {"ok": True, "started": False, "status": self.status()}
+            self.state.closing_volume_scan = {
+                "running": True,
+                "startedAt": _now_label(),
+                "status": f"Scanning {CLOSING_VOLUME_UNIVERSE}",
+                "error": None,
+            }
+            self.closing_scan_thread = threading.Thread(
+                target=self._run_manual_closing_volume_scan,
+                args=(clock,),
+                name="closing-volume-manual-scan",
+                daemon=True,
+            )
+            self.closing_scan_thread.start()
+        self.app_log.info("Manual closing volume scan started", universe=CLOSING_VOLUME_UNIVERSE)
+        return {"ok": True, "started": True, "status": self.status()}
+
+    def _run_manual_closing_volume_scan(self, clock: dict[str, Any]) -> None:
+        session_date = self._last_trading_date(dt.datetime.now().date())
+        target_date = self._next_trading_date(session_date + dt.timedelta(days=1))
+        try:
+            shortlist = self.generate_closing_volume_shortlist(session_date, target_date)
+            with self.paper_lock:
+                self.paper_engine.set_closing_volume_shortlist(shortlist)
+                paper_trading = self.paper_engine.snapshot()
+            with self.lock:
+                self.state.paper_trading = paper_trading
+                self.state.market_clock = clock
+                self.state.closing_volume_scan = {
+                    "running": False,
+                    "startedAt": self.state.closing_volume_scan.get("startedAt"),
+                    "finishedAt": _now_label(),
+                    "status": "Scan complete",
+                    "sourceDate": shortlist.get("sourceDate"),
+                    "targetDate": shortlist.get("targetDate"),
+                    "keepCount": shortlist.get("keepCount"),
+                    "rejectCount": shortlist.get("rejectCount"),
+                    "rowCount": len(shortlist.get("selected") or []),
+                    "error": None,
+                }
+            self.app_log.info(
+                "Manual closing volume scan finished",
+                sourceDate=shortlist.get("sourceDate"),
+                targetDate=shortlist.get("targetDate"),
+                keepCount=shortlist.get("keepCount"),
+                rejectCount=shortlist.get("rejectCount"),
+            )
+            self._refresh_price_stream_targets()
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
+                self.state.closing_volume_scan = {
+                    "running": False,
+                    "startedAt": self.state.closing_volume_scan.get("startedAt"),
+                    "finishedAt": _now_label(),
+                    "status": "Scan failed",
+                    "error": str(exc),
+                }
+            self.app_log.warn("Manual closing volume scan failed", error=str(exc))
 
     def status(self) -> dict[str, Any]:
         with self.lock:
@@ -4546,13 +4796,15 @@ class NSEStreamer:
         session_date = self._last_trading_date(now.date())
         target_date = self._next_trading_date(session_date + dt.timedelta(days=1))
         with self.paper_lock:
-            current_source = self.paper_engine.closing_volume_shortlist.get("sourceDate")
-            current_universe = self.paper_engine.closing_volume_shortlist.get("universe")
-            current_spike = _to_float(self.paper_engine.closing_volume_shortlist.get("spikeMultiple"))
+            current_shortlist = self.paper_engine.closing_volume_shortlist
+            current_source = current_shortlist.get("sourceDate")
+            current_universe = current_shortlist.get("universe")
+            current_spike = _to_float(current_shortlist.get("spikeMultiple"))
         if (
             current_source == _date_key(session_date)
             and current_universe == CLOSING_VOLUME_UNIVERSE
             and current_spike == CLOSING_VOLUME_SPIKE_MULTIPLE
+            and self._closing_volume_shortlist_has_context(current_shortlist)
         ):
             return
         try:
@@ -4581,6 +4833,8 @@ class NSEStreamer:
         resolved = self.price_streamer.resolver.resolve(symbols) if self.price_streamer.resolver else {}
         selected = []
         errors = []
+        delivery_by_symbol = self._delivery_context_by_symbol(session_date)
+        futures_by_symbol = self._futures_context_by_symbol(session_date)
         for symbol in symbols:
             instrument_key = resolved.get(symbol)
             if not instrument_key:
@@ -4594,9 +4848,16 @@ class NSEStreamer:
             if candidate:
                 selected.append(candidate)
 
-        bullish = sorted([row for row in selected if row.get("side") == "BUY"], key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
-        bearish = sorted([row for row in selected if row.get("side") == "SHORT"], key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
-        final_rows = bullish[:CLOSING_VOLUME_TOP_COUNT] + bearish[:CLOSING_VOLUME_TOP_COUNT]
+        ranked = sorted(selected, key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
+        final_rows = self._closing_volume_select_with_rejections(ranked, max(1, CLOSING_VOLUME_MAX_TRADES))
+        upstox_futures_by_symbol = self._upstox_futures_context_by_symbol(
+            [str(row.get("symbol") or "").strip().upper() for row in final_rows],
+            session_date,
+        )
+        final_rows = [
+            self._enrich_closing_volume_candidate(row, delivery_by_symbol, futures_by_symbol, upstox_futures_by_symbol)
+            for row in final_rows
+        ]
         final_rows.sort(key=lambda row: _to_float(row.get("score")) or 0, reverse=True)
         return {
             "sourceDate": _date_key(session_date),
@@ -4605,14 +4866,210 @@ class NSEStreamer:
             "universe": CLOSING_VOLUME_UNIVERSE,
             "lookbackDays": CLOSING_VOLUME_LOOKBACK_DAYS,
             "topCountPerSide": CLOSING_VOLUME_TOP_COUNT,
+            "maxKeepTrades": CLOSING_VOLUME_MAX_TRADES,
             "spikeMultiple": CLOSING_VOLUME_SPIKE_MULTIPLE,
             "minDailyVolumePct": CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT * 100,
             "minBodyPct": CLOSING_VOLUME_MIN_BODY_PCT * 100,
             "selected": final_rows,
+            "keepCount": len([row for row in final_rows if PaperTradingEngine._closing_volume_row_tradeable(row)]),
+            "rejectCount": len([row for row in final_rows if str(row.get("trendDecision") or "").upper() == "REJECT"]),
             "eligibleCount": len(selected),
             "errorCount": len(errors),
             "errors": errors[:12],
         }
+
+    def _closing_volume_select_with_rejections(
+        self,
+        ranked_rows: list[dict[str, Any]],
+        keep_target: int,
+    ) -> list[dict[str, Any]]:
+        selected = []
+        keep_count = 0
+        for row in ranked_rows:
+            selected.append(row)
+            if PaperTradingEngine._closing_volume_row_tradeable(row):
+                keep_count += 1
+                if keep_count >= keep_target:
+                    break
+        return selected
+
+    @staticmethod
+    def _closing_volume_shortlist_has_context(shortlist: dict[str, Any]) -> bool:
+        rows = shortlist.get("selected") if isinstance(shortlist, dict) else None
+        if not isinstance(rows, list) or not rows:
+            return bool(shortlist.get("enrichedAt"))
+        return all(
+            isinstance(row, dict)
+            and "deliveryPct" in row
+            and "institutionRead" in row
+            and "dayTrend" in row
+            and "trendDecision" in row
+            for row in rows
+        )
+
+    def enrich_closing_volume_shortlist(self, shortlist: dict[str, Any]) -> dict[str, Any]:
+        source_date = _parse_nse_date(shortlist.get("sourceDate")) if isinstance(shortlist, dict) else None
+        if not source_date:
+            return shortlist
+        delivery_by_symbol = self._delivery_context_by_symbol(source_date)
+        futures_by_symbol = self._futures_context_by_symbol(source_date)
+        rows = shortlist.get("selected") if isinstance(shortlist.get("selected"), list) else []
+        upstox_futures_by_symbol = self._upstox_futures_context_by_symbol(
+            [str(row.get("symbol") or "").strip().upper() for row in rows if isinstance(row, dict)],
+            source_date,
+        )
+        enriched = [
+            self._enrich_closing_volume_candidate(row, delivery_by_symbol, futures_by_symbol, upstox_futures_by_symbol)
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return {
+            **shortlist,
+            "selected": enriched,
+            "enrichedAt": _now_label(),
+            "enrichment": {
+                "deliverySource": "NSE sec_bhavdata_full",
+                "futuresSource": "Upstox market quote + NSE FO UDiFF bhavcopy",
+            },
+        }
+
+    def _delivery_context_by_symbol(self, trade_date: dt.date) -> dict[str, dict[str, Any]]:
+        try:
+            rows = self.client.fetch_delivery_bhavcopy(trade_date)
+        except Exception as exc:  # noqa: BLE001 - enrichment is useful but not mandatory
+            self.app_log.warn("NSE delivery bhavcopy fetch failed", date=_date_key(trade_date), error=str(exc))
+            return {}
+        context = {}
+        for row in rows:
+            symbol = str(row.get("SYMBOL") or "").strip().upper()
+            series = str(row.get("SERIES") or "").strip().upper()
+            if not symbol or series != "EQ":
+                continue
+            context[symbol] = {
+                "deliveryPct": _round_price(_to_float(row.get("DELIV_PER"))),
+                "deliverableQty": int(_to_float(row.get("DELIV_QTY")) or 0),
+                "tradedQty": int(_to_float(row.get("TTL_TRD_QNTY")) or 0),
+                "cashClose": _round_price(_to_float(row.get("CLOSE_PRICE"))),
+                "cashLast": _round_price(_to_float(row.get("LAST_PRICE"))),
+            }
+        return context
+
+    def _futures_context_by_symbol(self, trade_date: dt.date) -> dict[str, dict[str, Any]]:
+        try:
+            rows = self.client.fetch_fo_bhavcopy(trade_date)
+        except Exception as exc:  # noqa: BLE001 - many selected NIFTY 500 names may not be in F&O
+            self.app_log.warn("NSE FO bhavcopy fetch failed", date=_date_key(trade_date), error=str(exc))
+            return {}
+        futures_rows = [
+            row for row in rows
+            if str(row.get("FinInstrmTp") or "").strip().upper() == "STF"
+            and str(row.get("TckrSymb") or "").strip()
+        ]
+        grouped: dict[str, list[dict[str, str]]] = {}
+        for row in futures_rows:
+            grouped.setdefault(str(row.get("TckrSymb") or "").strip().upper(), []).append(row)
+        context = {}
+        for symbol, symbol_rows in grouped.items():
+            front = self._front_month_future(symbol_rows, trade_date)
+            if not front:
+                continue
+            close = _to_float(front.get("ClsPric"))
+            previous_close = _to_float(front.get("PrvsClsgPric"))
+            price_change = close - previous_close if close is not None and previous_close is not None else None
+            price_change_pct = (price_change / previous_close) * 100 if price_change is not None and previous_close else None
+            oi = _to_float(front.get("OpnIntrst"))
+            oi_change = _to_float(front.get("ChngInOpnIntrst"))
+            context[symbol] = {
+                "futuresExpiry": front.get("XpryDt") or front.get("FininstrmActlXpryDt"),
+                "futuresClose": _round_price(close),
+                "futuresPriceChange": _round_price(price_change),
+                "futuresPriceChangePct": _round_price(price_change_pct),
+                "futuresOi": int(oi or 0),
+                "futuresOiChange": int(oi_change or 0),
+                "futuresVolumeContracts": int(_to_float(front.get("TtlTradgVol")) or 0),
+                "futuresLotSize": int(_to_float(front.get("NewBrdLotQty")) or 0),
+                "futuresSignal": self._futures_oi_signal(price_change, oi_change),
+            }
+        return context
+
+    def _upstox_futures_context_by_symbol(self, symbols: list[str], trade_date: dt.date) -> dict[str, dict[str, Any]]:
+        context = {}
+        for symbol in symbols:
+            clean_symbol = str(symbol or "").strip().upper()
+            if not clean_symbol:
+                continue
+            quote = self.price_streamer.quote_stock_future(clean_symbol, trade_date)
+            if quote.get("futureError"):
+                continue
+            context[clean_symbol] = quote
+        return context
+
+    @staticmethod
+    def _front_month_future(rows: list[dict[str, str]], trade_date: dt.date) -> dict[str, str] | None:
+        dated = []
+        for row in rows:
+            expiry = _parse_nse_date(row.get("XpryDt") or row.get("FininstrmActlXpryDt"))
+            if not expiry:
+                continue
+            dated.append((expiry, row))
+        future_expiries = sorted((item for item in dated if item[0] >= trade_date), key=lambda item: item[0])
+        if future_expiries:
+            return future_expiries[0][1]
+        if dated:
+            return sorted(dated, key=lambda item: item[0])[-1][1]
+        return None
+
+    @staticmethod
+    def _futures_oi_signal(price_change: float | None, oi_change: float | None) -> str:
+        if price_change is None or oi_change is None or oi_change == 0 or price_change == 0:
+            return "Neutral / insufficient futures OI signal"
+        if price_change > 0 and oi_change > 0:
+            return "Long buildup"
+        if price_change > 0 and oi_change < 0:
+            return "Short covering"
+        if price_change < 0 and oi_change > 0:
+            return "Short buildup"
+        return "Long unwinding"
+
+    def _enrich_closing_volume_candidate(
+        self,
+        candidate: dict[str, Any],
+        delivery_by_symbol: dict[str, dict[str, Any]],
+        futures_by_symbol: dict[str, dict[str, Any]],
+        upstox_futures_by_symbol: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        symbol = str(candidate.get("symbol") or "").strip().upper()
+        delivery = delivery_by_symbol.get(symbol, {})
+        nse_futures = futures_by_symbol.get(symbol, {})
+        upstox_futures = upstox_futures_by_symbol.get(symbol, {})
+        futures = {**nse_futures, **upstox_futures}
+        if nse_futures.get("futuresOiChange") is not None:
+            futures["futuresOiChange"] = nse_futures.get("futuresOiChange")
+        if nse_futures.get("futuresSignal"):
+            futures["futuresSignal"] = nse_futures.get("futuresSignal")
+        return {
+            **candidate,
+            **delivery,
+            **futures,
+            "institutionRead": self._institution_read(candidate, delivery, futures),
+        }
+
+    @staticmethod
+    def _institution_read(candidate: dict[str, Any], delivery: dict[str, Any], futures: dict[str, Any]) -> str:
+        side = str(candidate.get("side") or "").upper()
+        delivery_pct = _to_float(delivery.get("deliveryPct"))
+        futures_signal = str(futures.get("futuresSignal") or "")
+        if futures_signal and not futures_signal.startswith("Neutral"):
+            return futures_signal
+        if futures:
+            return "Futures OI neutral"
+        if delivery_pct is None:
+            return "Delivery/F&O context unavailable"
+        if delivery_pct >= 35:
+            return "Delivery buying/accumulation likely" if side == "BUY" else "Delivery selling/distribution likely"
+        if delivery_pct <= 20:
+            return "Mostly intraday churn; confirm next open"
+        return "Moderate delivery participation"
 
     def _closing_volume_candidate(
         self,
@@ -4642,6 +5099,14 @@ class NSEStreamer:
         body_pct = abs(final_close - final_open) / final_open
         if body_pct < CLOSING_VOLUME_MIN_BODY_PCT:
             return None
+
+        session_daily = next((row for row in daily if row.get("date") == session_date), {})
+        day_open = _to_float(session_daily.get("open"))
+        day_high = _to_float(session_daily.get("high"))
+        day_low = _to_float(session_daily.get("low"))
+        day_close = _to_float(session_daily.get("close"))
+        day_trend = self._closing_volume_day_trend(day_open, day_close)
+        trend_decision, trend_reason = self._closing_volume_trend_decision(side, day_trend)
 
         final_by_date: dict[dt.date, dict[str, Any]] = {}
         for row in candles_15m:
@@ -4683,6 +5148,15 @@ class NSEStreamer:
             "final15Low": _round_price(final_low),
             "final15Close": _round_price(final_close),
             "final15Volume": int(final_volume),
+            "dayOpen": _round_price(day_open),
+            "dayHigh": _round_price(day_high),
+            "dayLow": _round_price(day_low),
+            "dayClose": _round_price(day_close),
+            "dayTrend": day_trend,
+            "dayChangePct": _round_price(((day_close - day_open) / day_open) * 100) if day_open and day_close is not None else None,
+            "trendDecision": trend_decision,
+            "trendRejectReason": trend_reason,
+            "tradeable": trend_decision == "KEEP",
             "avgFinal15Volume": int(avg_final15),
             "avgDailyVolume": int(avg_daily),
             "volumeSpike": round(volume_spike, 2),
@@ -4690,6 +5164,29 @@ class NSEStreamer:
             "final15BodyPct": round(body_pct * 100, 2),
             "score": round(score, 2),
         }
+
+    @staticmethod
+    def _closing_volume_day_trend(day_open: float | None, day_close: float | None) -> str:
+        if day_open is None or day_close is None:
+            return "UNKNOWN"
+        if day_close > day_open:
+            return "BULLISH"
+        if day_close < day_open:
+            return "BEARISH"
+        return "FLAT"
+
+    @staticmethod
+    def _closing_volume_trend_decision(side: str, day_trend: str) -> tuple[str, str]:
+        clean_side = str(side or "").strip().upper()
+        clean_trend = str(day_trend or "").strip().upper()
+        if clean_side == "BUY" and clean_trend == "BULLISH":
+            return "KEEP", "BUY signal matches bullish day trend"
+        if clean_side == "SHORT" and clean_trend == "BEARISH":
+            return "KEEP", "SHORT signal matches bearish day trend"
+        if clean_trend in {"UNKNOWN", "FLAT"}:
+            return "REJECT", f"REJECT: day trend is {clean_trend.lower()}"
+        expected = "bullish" if clean_side == "BUY" else "bearish"
+        return "REJECT", f"REJECT: {clean_side} signal needs {expected} day trend, got {clean_trend.lower()}"
 
     def _market_clock(self, force: bool = False) -> dict[str, Any]:
         today = dt.datetime.now().date()
@@ -4700,6 +5197,7 @@ class NSEStreamer:
         is_weekend = today.weekday() >= 5
         is_holiday = bool(holiday_name)
         in_hours = MARKET_OPEN_TIME <= now.time() <= MARKET_CLOSE_TIME
+        after_market_close = now.time() > MARKET_CLOSE_TIME
         should_stream = not is_weekend and not is_holiday and in_hours
         if is_weekend:
             reason = "Weekend"
@@ -4722,6 +5220,7 @@ class NSEStreamer:
             "reason": reason,
             "isWeekend": is_weekend,
             "isHoliday": is_holiday,
+            "afterMarketClose": after_market_close,
             "holidayName": holiday_name,
             "marketOpenTime": MARKET_OPEN_TIME.strftime("%H:%M"),
             "marketCloseTime": MARKET_CLOSE_TIME.strftime("%H:%M"),
@@ -5130,6 +5629,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self._json({"ok": True, "stopped": stopped, "status": streamer.status()})
         elif self.path == "/api/refresh":
             self._json({"ok": True, "status": streamer.refresh_once()})
+        elif self.path == "/api/closing-volume/scan":
+            result = streamer.trigger_closing_volume_scan()
+            self._json(result, 200 if result.get("ok") else 400)
         elif self.path == "/api/paper-trades/close":
             payload = self._read_json()
             result = streamer.close_paper_trade(str(payload.get("trade_id") or payload.get("id") or ""))

@@ -28,8 +28,9 @@ function applyTheme(theme) {
 
 async function api(path, options = {}) {
   const res = await fetch(path, options);
-  if (!res.ok) throw new Error(`${path} failed: ${res.status}`);
-  return res.json();
+  const payload = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(payload.error || `${path} failed: ${res.status}`);
+  return payload;
 }
 
 function fmt(value, digits = 2) {
@@ -395,6 +396,9 @@ function renderPaperTrading(paper) {
   const closedTrades = data.closedTrades || [];
   const closingVolume = data.closingVolumeShortlist || {};
   const closingRows = closingVolume.selected || [];
+  const fullStatus = state.status || {};
+  const clock = fullStatus.market_clock || {};
+  const scan = fullStatus.closing_volume_scan || {};
 
   q("#p-initial").textContent = fmt(data.initialCapital, 0);
   q("#p-available").textContent = fmt(data.availableCapital, 0);
@@ -411,9 +415,22 @@ function renderPaperTrading(paper) {
   q("#p-saved").className = data.persistenceError ? "bad" : "";
   q("#p-idea-count").textContent = data.sessionOpen ? `${ideas.length} ideas` : data.sessionStatus || "Waiting for session";
   q("#p-closed-count").textContent = `${data.closedCount || 0} closed`;
+  const keepCount = closingVolume.keepCount ?? closingRows.filter((row) => row.tradeable !== false && String(row.trendDecision || "KEEP").toUpperCase() === "KEEP").length;
+  const rejectCount = closingVolume.rejectCount ?? closingRows.filter((row) => String(row.trendDecision || "").toUpperCase() === "REJECT").length;
   q("#closing-volume-status").textContent = closingVolume.sourceDate
-    ? `${closingVolume.sourceDate} -> ${closingVolume.targetDate || "-"} / ${closingRows.length} stocks`
+    ? `${closingVolume.sourceDate} -> ${closingVolume.targetDate || "-"} / ${keepCount} keep, ${rejectCount} reject${scan.running ? " / scanning..." : ""}`
     : "No shortlist";
+  const scanButton = q("#closing-volume-scan-btn");
+  if (scanButton) {
+    const allowed = Boolean(clock.afterMarketClose) && !scan.running;
+    scanButton.disabled = !allowed;
+    scanButton.textContent = scan.running ? "Scanning..." : "Scan NIFTY 500";
+    scanButton.title = allowed
+      ? "Run the after-close NIFTY 500 closing-volume scan now"
+      : scan.running
+        ? "NIFTY 500 scan is already running"
+        : `Available after ${clock.marketCloseTime || "market close"}`;
+  }
 
   q("#paper-ideas-body").innerHTML = data.persistenceError ? `<tr><td colspan="11" class="empty-state bad">${safe(data.persistenceError)}</td></tr>` : ideas.length ? ideas.map((idea) => `
     <tr class="${idea.ready ? "ready-row" : ""}">
@@ -437,29 +454,42 @@ function renderPaperTrading(paper) {
     </tr>
   `).join("") : `<tr><td colspan="11" class="empty-state">${safe(data.sessionStatus || "Waiting for selected stocks and M5 candles.")}</td></tr>`;
 
-  q("#closing-volume-body").innerHTML = closingRows.length ? closingRows.map((row) => `
-    <tr>
+  q("#closing-volume-body").innerHTML = closingRows.length ? closingRows.map((row) => {
+    const trendDecision = String(row.trendDecision || (row.tradeable === false ? "REJECT" : "KEEP")).toUpperCase();
+    const rejected = trendDecision === "REJECT";
+    return `
+    <tr class="${rejected ? "rejected-row" : ""}">
       <td>
         <strong>${safe(row.symbol)}</strong>
         <span>${safe(row.sessionDate || "-")} -> ${safe(row.targetDate || "-")}</span>
       </td>
       <td class="${tradeSideClass(row.side)}">${safe(row.side)}</td>
       <td>
+        <strong class="${rejected ? "bad" : "good"}">${safe(trendDecision)}</strong>
+        <span>${safe(row.dayTrend || "-")} / O ${fmtMaybe(row.dayOpen)} C ${fmtMaybe(row.dayClose)}</span>
+        <span>${safe(row.trendRejectReason || "")}</span>
+      </td>
+      <td>
         O ${fmtMaybe(row.final15Open)} C ${fmtMaybe(row.final15Close)}
         <span>${fmtMaybe(row.final15BodyPct)}% body</span>
       </td>
       <td>
         ${fmtMaybe(row.final15Volume, 0)}
-        <span>${fmtMaybe(row.dailyVolumeSharePct)}% of avg day</span>
+        <span>${fmtMaybe(row.volumeSpike)}x final 15m / ${fmtMaybe(row.dailyVolumeSharePct)}% day</span>
       </td>
-      <td>${fmtMaybe(row.avgDailyVolume, 0)}</td>
       <td>
-        ${fmtMaybe(row.avgFinal15Volume, 0)}
-        <span>${fmtMaybe(row.volumeSpike)}x</span>
+        ${fmtMaybe(row.deliveryPct)}%
+        <span>${fmtMaybe(row.deliverableQty, 0)} delivered</span>
       </td>
+      <td>
+        ${row.futuresSignal ? fmtMaybe(row.futuresOiChange, 0) : "-"}
+        <span>${safe(row.futuresSignal || "No stock futures")}</span>
+      </td>
+      <td>${safe(row.institutionRead || "-")}</td>
       <td>${fmtMaybe(row.score)}</td>
     </tr>
-  `).join("") : "<tr><td colspan=\"7\" class=\"empty-state\">No closing-volume shortlist yet.</td></tr>";
+  `;
+  }).join("") : "<tr><td colspan=\"9\" class=\"empty-state\">No closing-volume shortlist yet.</td></tr>";
 
   q("#active-trades-body").innerHTML = activeTrades.length ? activeTrades.map((trade) => `
     <tr>
@@ -916,6 +946,10 @@ q("#stop-btn").addEventListener("click", () => command("/api/stop").catch((err) 
 }));
 q("#refresh-btn").addEventListener("click", () => command("/api/refresh").catch((err) => {
   q("#status-line").textContent = err.message;
+}));
+q("#closing-volume-scan-btn").addEventListener("click", () => command("/api/closing-volume/scan").catch((err) => {
+  q("#status-line").textContent = err.message;
+  q("#status-line").className = "bad";
 }));
 q("#paper-pnl-date").addEventListener("change", (event) => {
   const selectedDate = event.target.value;

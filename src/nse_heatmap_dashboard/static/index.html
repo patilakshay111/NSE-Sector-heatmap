@@ -173,13 +173,16 @@
       <div class="panel paper-panel">
         <div class="panel-head">
           <h2>Closing Volume Shortlist</h2>
-          <span id="closing-volume-status">-</span>
+          <div class="panel-head-actions">
+            <span id="closing-volume-status">-</span>
+            <button id="closing-volume-scan-btn" class="ghost" type="button" disabled>Scan NIFTY 500</button>
+          </div>
         </div>
         <div class="table-scroll">
           <table>
             <thead>
               <tr>
-                <th>Stock</th><th>Side</th><th>Final 15m</th><th>Volume</th><th>Avg Daily</th><th>Avg Final 15m</th><th>Score</th>
+                <th>Stock</th><th>Side</th><th>Trend</th><th>Final 15m</th><th>Volume</th><th>Delivery</th><th>Futures OI</th><th>Read</th><th>Score</th>
               </tr>
             </thead>
             <tbody id="closing-volume-body"></tbody>
