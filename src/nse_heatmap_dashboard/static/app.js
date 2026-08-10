@@ -4,6 +4,10 @@ const state = {
   pnlDate: null,
   paperTradesMode: "today",
   paperTradesDate: null,
+  optionsTradesMode: "today",
+  optionsTradesDate: null,
+  overallMode: "today",
+  overallDate: null,
   theme: document.documentElement.dataset.theme === "dark" ? "dark" : "light",
 };
 
@@ -110,6 +114,8 @@ function heatColor(value) {
 }
 
 function titleForView(view) {
+  const nav = document.querySelector(`.nav[data-view="${view}"]`);
+  if (nav?.textContent) return nav.textContent.trim();
   return String(view || "")
     .split("-")
     .map((part) => part ? part[0].toUpperCase() + part.slice(1) : "")
@@ -378,6 +384,116 @@ function paperTradeStats(trades) {
   };
 }
 
+function tradeIsClosed(trade) {
+  return exitReason(trade) !== "ACTIVE" || hasNumber(trade?.realizedPnl) || Boolean(trade?.exitTime || trade?.closedAt);
+}
+
+function tradePnlValue(trade) {
+  return Number(trade?.realizedPnl ?? trade?.unrealizedPnl ?? 0);
+}
+
+function tradeAccountDate(trade) {
+  return tradeDateKey(trade?.exitTime || trade?.closedAt || trade?.entryTime || trade?.openedAt);
+}
+
+function normalizeOverallTrade(trade, segment) {
+  const closed = tradeIsClosed(trade);
+  const symbol = segment === "Options"
+    ? String(trade.underlyingSymbol || trade.underlying || trade.symbol || "-").replace(/\s+ATM\s+(CE|PE)$/i, "")
+    : String(trade.symbol || "-");
+  return {
+    ...trade,
+    segment,
+    accountDate: tradeAccountDate(trade),
+    groupSymbol: symbol || "-",
+    thesis: String(trade.thesis || "-"),
+    closed,
+    pnl: tradePnlValue(trade),
+    realizedPnlValue: closed ? Number(trade.realizedPnl || 0) : 0,
+    unrealizedPnlValue: closed ? 0 : Number(trade.unrealizedPnl || 0),
+  };
+}
+
+function overallTrades(status) {
+  const equityTrades = (status.paper_trading?.allTrades || []).map((trade) => normalizeOverallTrade(trade, "Equity"));
+  const optionTrades = (status.options_paper_trading?.allTrades || []).map((trade) => normalizeOverallTrade(trade, "Options"));
+  return [...equityTrades, ...optionTrades].filter((trade) => trade.accountDate);
+}
+
+function filteredOverallTrades(status) {
+  const trades = overallTrades(status);
+  const today = status.paper_trading?.dailyReport?.today || status.paper_trading?.dailyReport?.date || new Date().toISOString().slice(0, 10);
+  const selectedDate = state.overallMode === "all" ? "" : state.overallDate || today;
+  return {
+    today,
+    selectedDate,
+    trades: selectedDate ? trades.filter((trade) => trade.accountDate === selectedDate) : trades,
+  };
+}
+
+function closedStatsForPnls(pnls) {
+  const wins = pnls.filter((pnl) => pnl > 0).length;
+  const losses = pnls.filter((pnl) => pnl < 0).length;
+  const grossProfit = pnls.filter((pnl) => pnl > 0).reduce((sum, pnl) => sum + pnl, 0);
+  const grossLoss = Math.abs(pnls.filter((pnl) => pnl < 0).reduce((sum, pnl) => sum + pnl, 0));
+  const profitFactor = grossLoss ? grossProfit / grossLoss : null;
+  return {
+    wins,
+    losses,
+    winRate: pnls.length ? (wins / pnls.length) * 100 : null,
+    profitFactor,
+    profitFactorLabel: profitFactor === null ? (grossProfit > 0 ? "No losses" : "-") : fmt(profitFactor, 2),
+  };
+}
+
+function overallMaxDrawdown(trades) {
+  let equity = 0;
+  let peak = 0;
+  let maxDrawdown = 0;
+  trades
+    .filter((trade) => trade.closed)
+    .sort((left, right) => tradeTimestamp(left.exitTime || left.closedAt || left.entryTime || left.openedAt) - tradeTimestamp(right.exitTime || right.closedAt || right.entryTime || right.openedAt))
+    .forEach((trade) => {
+      equity += Number(trade.realizedPnlValue || 0);
+      peak = Math.max(peak, equity);
+      maxDrawdown = Math.max(maxDrawdown, peak - equity);
+    });
+  return maxDrawdown;
+}
+
+function groupOverallRows(trades, keyFn, seedFn) {
+  const groups = new Map();
+  trades.forEach((trade) => {
+    const key = keyFn(trade);
+    if (!groups.has(key)) groups.set(key, seedFn(trade, key));
+    const row = groups.get(key);
+    row.trades += 1;
+    row.totalPnl += trade.pnl;
+    row.realizedPnl += trade.realizedPnlValue;
+    row.unrealizedPnl += trade.unrealizedPnlValue;
+    row.best = Math.max(row.best, trade.pnl);
+    row.worst = Math.min(row.worst, trade.pnl);
+    if (trade.closed) row.closedPnls.push(trade.realizedPnlValue);
+    if (trade.segment === "Equity") {
+      row.equityPnl += trade.pnl;
+      row.equityTrades += 1;
+    } else {
+      row.optionsPnl += trade.pnl;
+      row.optionsTrades += 1;
+    }
+  });
+  return [...groups.values()].map((row) => {
+    const stats = closedStatsForPnls(row.closedPnls);
+    return {
+      ...row,
+      winRate: stats.winRate,
+      profitFactorLabel: stats.profitFactorLabel,
+      best: Number.isFinite(row.best) ? row.best : 0,
+      worst: Number.isFinite(row.worst) ? row.worst : 0,
+    };
+  }).sort((left, right) => right.totalPnl - left.totalPnl);
+}
+
 function renderPaperTradeStats(stats) {
   q("#pt-total").textContent = fmt(stats.total, 0);
   q("#pt-active").textContent = fmt(stats.active, 0);
@@ -394,11 +510,6 @@ function renderPaperTrading(paper) {
   const ideas = data.ideas || [];
   const activeTrades = data.openTrades || data.activeTrades || [];
   const closedTrades = data.closedTrades || [];
-  const closingVolume = data.closingVolumeShortlist || {};
-  const closingRows = closingVolume.selected || [];
-  const fullStatus = state.status || {};
-  const clock = fullStatus.market_clock || {};
-  const scan = fullStatus.closing_volume_scan || {};
 
   q("#p-initial").textContent = fmt(data.initialCapital, 0);
   q("#p-available").textContent = fmt(data.availableCapital, 0);
@@ -415,23 +526,6 @@ function renderPaperTrading(paper) {
   q("#p-saved").className = data.persistenceError ? "bad" : "";
   q("#p-idea-count").textContent = data.sessionOpen ? `${ideas.length} ideas` : data.sessionStatus || "Waiting for session";
   q("#p-closed-count").textContent = `${data.closedCount || 0} closed`;
-  const keepCount = closingVolume.keepCount ?? closingRows.filter((row) => row.tradeable !== false && String(row.trendDecision || "KEEP").toUpperCase() === "KEEP").length;
-  const rejectCount = closingVolume.rejectCount ?? closingRows.filter((row) => String(row.trendDecision || "").toUpperCase() === "REJECT").length;
-  q("#closing-volume-status").textContent = closingVolume.sourceDate
-    ? `${closingVolume.sourceDate} -> ${closingVolume.targetDate || "-"} / ${keepCount} keep, ${rejectCount} reject${scan.running ? " / scanning..." : ""}`
-    : "No shortlist";
-  const scanButton = q("#closing-volume-scan-btn");
-  if (scanButton) {
-    const allowed = Boolean(clock.afterMarketClose) && !scan.running;
-    scanButton.disabled = !allowed;
-    scanButton.textContent = scan.running ? "Scanning..." : "Scan NIFTY 500";
-    scanButton.title = allowed
-      ? "Run the after-close NIFTY 500 closing-volume scan now"
-      : scan.running
-        ? "NIFTY 500 scan is already running"
-        : `Available after ${clock.marketCloseTime || "market close"}`;
-  }
-
   q("#paper-ideas-body").innerHTML = data.persistenceError ? `<tr><td colspan="11" class="empty-state bad">${safe(data.persistenceError)}</td></tr>` : ideas.length ? ideas.map((idea) => `
     <tr class="${idea.ready ? "ready-row" : ""}">
       <td>
@@ -453,43 +547,6 @@ function renderPaperTrading(paper) {
       <td><span class="status-pill ${idea.ready ? "ready" : ""}">${safe(idea.status)}</span></td>
     </tr>
   `).join("") : `<tr><td colspan="11" class="empty-state">${safe(data.sessionStatus || "Waiting for selected stocks and M5 candles.")}</td></tr>`;
-
-  q("#closing-volume-body").innerHTML = closingRows.length ? closingRows.map((row) => {
-    const trendDecision = String(row.trendDecision || (row.tradeable === false ? "REJECT" : "KEEP")).toUpperCase();
-    const rejected = trendDecision === "REJECT";
-    return `
-    <tr class="${rejected ? "rejected-row" : ""}">
-      <td>
-        <strong>${safe(row.symbol)}</strong>
-        <span>${safe(row.sessionDate || "-")} -> ${safe(row.targetDate || "-")}</span>
-      </td>
-      <td class="${tradeSideClass(row.side)}">${safe(row.side)}</td>
-      <td>
-        <strong class="${rejected ? "bad" : "good"}">${safe(trendDecision)}</strong>
-        <span>${safe(row.dayTrend || "-")} / O ${fmtMaybe(row.dayOpen)} C ${fmtMaybe(row.dayClose)}</span>
-        <span>${safe(row.trendRejectReason || "")}</span>
-      </td>
-      <td>
-        O ${fmtMaybe(row.final15Open)} C ${fmtMaybe(row.final15Close)}
-        <span>${fmtMaybe(row.final15BodyPct)}% body</span>
-      </td>
-      <td>
-        ${fmtMaybe(row.final15Volume, 0)}
-        <span>${fmtMaybe(row.volumeSpike)}x final 15m / ${fmtMaybe(row.dailyVolumeSharePct)}% day</span>
-      </td>
-      <td>
-        ${fmtMaybe(row.deliveryPct)}%
-        <span>${fmtMaybe(row.deliverableQty, 0)} delivered</span>
-      </td>
-      <td>
-        ${row.futuresSignal ? fmtMaybe(row.futuresOiChange, 0) : "-"}
-        <span>${safe(row.futuresSignal || "No stock futures")}</span>
-      </td>
-      <td>${safe(row.institutionRead || "-")}</td>
-      <td>${fmtMaybe(row.score)}</td>
-    </tr>
-  `;
-  }).join("") : "<tr><td colspan=\"9\" class=\"empty-state\">No closing-volume shortlist yet.</td></tr>";
 
   q("#active-trades-body").innerHTML = activeTrades.length ? activeTrades.map((trade) => `
     <tr>
@@ -719,6 +776,77 @@ function syncPaperTradesControls(today, selectedDate) {
   dateInput.max = today || "";
 }
 
+function renderOptionsTradeStats(stats) {
+  q("#ot-total").textContent = fmt(stats.total, 0);
+  q("#ot-active").textContent = fmt(stats.active, 0);
+  q("#ot-closed").textContent = fmt(stats.closed, 0);
+  q("#ot-win-rate").textContent = Number.isFinite(Number(stats.winRate)) ? pct(stats.winRate) : "-";
+  q("#ot-pnl").textContent = fmt(stats.totalPnl);
+  q("#ot-pnl").className = changeClass(stats.totalPnl);
+  q("#ot-max-dd").textContent = fmt(stats.maxDrawdown);
+  q("#ot-max-dd").className = stats.maxDrawdown > 0 ? "bad" : "";
+}
+
+function syncOptionsTradesControls(today, selectedDate) {
+  const todayButton = q("#options-trades-today");
+  const allButton = q("#options-trades-all");
+  const dateInput = q("#options-trades-date");
+  if (!todayButton || !allButton || !dateInput) return;
+  todayButton.classList.toggle("active", state.optionsTradesMode === "today");
+  allButton.classList.toggle("active", state.optionsTradesMode === "all");
+  dateInput.value = selectedDate || "";
+  dateInput.max = today || "";
+}
+
+function renderOptionsTradesIndex(options) {
+  const data = options || {};
+  const allTrades = [...(data.allTrades || [])].sort((left, right) => (
+    tradeTimestamp(right.entryTime || right.openedAt) - tradeTimestamp(left.entryTime || left.openedAt)
+  ));
+  const today = state.status?.paper_trading?.dailyReport?.today || new Date().toISOString().slice(0, 10);
+  const selectedDate = state.optionsTradesMode === "all" ? "" : state.optionsTradesDate || today;
+  const trades = selectedDate
+    ? allTrades.filter((trade) => tradeDateKey(trade.entryTime || trade.openedAt) === selectedDate)
+    : allTrades;
+  syncOptionsTradesControls(today, selectedDate);
+  renderOptionsTradeStats(paperTradeStats(trades));
+  const countSuffix = selectedDate ? ` for ${selectedDate}` : "";
+  q("#options-trades-count").textContent = trades.length ? `${trades.length} trades${countSuffix}` : `No trades${countSuffix}`;
+  q("#all-options-trades-body").innerHTML = trades.length ? trades.map((trade) => {
+    const pnl = trade.realizedPnl ?? trade.unrealizedPnl;
+    const exitOrCurrent = trade.exitPrice ?? trade.currentPrice;
+    return `
+      <tr>
+        <td>
+          <strong>${safe(trade.id)}</strong>
+          <span>${safe(trade.status || "ACTIVE")}</span>
+        </td>
+        <td>
+          ${safe(trade.symbol)}
+          <span>${safe(trade.expiry || "-")} / ${safe(trade.optionType || "-")} ${fmtMaybe(trade.strike, 0)}</span>
+        </td>
+        <td>${safe(trade.underlyingSymbol || trade.underlying || "-")}</td>
+        <td>${safe(trade.thesis || "-")}</td>
+        <td>${formatEntryTime(trade.entryTime || trade.openedAt)}</td>
+        <td>${fmt(trade.entry)}</td>
+        <td>${fmt(exitOrCurrent)}</td>
+        <td>${fmt(trade.stopLoss)}</td>
+        <td>${fmt(trade.target)}</td>
+        <td>${fmt(trade.quantity, 0)}</td>
+        <td>
+          H ${fmtMaybe(trade.highSinceEntry)}
+          <span>L ${fmtMaybe(trade.lowSinceEntry)} / ${fmtMaybe(trade.maxFavorablePct)}% ${fmtMaybe(trade.maxAdversePct)}%</span>
+        </td>
+        <td>
+          ${safe(exitReason(trade))}
+          <span>${formatExitTime(trade.exitTime || trade.closedAt)}</span>
+        </td>
+        <td class="${changeClass(pnl)}">${fmt(pnl)}</td>
+      </tr>
+    `;
+  }).join("") : "<tr><td colspan=\"13\" class=\"empty-state\">No options trades yet.</td></tr>";
+}
+
 function reportPnlRows(rows, emptyText, colspan = 8) {
   if (!rows.length) {
     return `<tr><td colspan="${colspan}" class="empty-state">${emptyText}</td></tr>`;
@@ -785,6 +913,141 @@ async function loadPaperReport(dateKey) {
   const query = dateKey ? `?date=${encodeURIComponent(dateKey)}` : "";
   const result = await api(`/api/paper-pnl${query}`);
   renderPaperReport(result.dailyReport || {}, { syncDate: true });
+}
+
+function syncOverallControls(today, selectedDate) {
+  const todayButton = q("#overall-today");
+  const allButton = q("#overall-all");
+  const dateInput = q("#overall-date");
+  if (!todayButton || !allButton || !dateInput) return;
+  todayButton.classList.toggle("active", state.overallMode === "today");
+  allButton.classList.toggle("active", state.overallMode === "all");
+  dateInput.value = selectedDate || "";
+  dateInput.max = today || "";
+}
+
+function renderOverallStats(status) {
+  const { today, selectedDate, trades } = filteredOverallTrades(status || {});
+  syncOverallControls(today, selectedDate);
+
+  const equityPnl = trades.filter((trade) => trade.segment === "Equity").reduce((sum, trade) => sum + trade.pnl, 0);
+  const optionsPnl = trades.filter((trade) => trade.segment === "Options").reduce((sum, trade) => sum + trade.pnl, 0);
+  const openPnl = trades.reduce((sum, trade) => sum + trade.unrealizedPnlValue, 0);
+  const closedPnls = trades.filter((trade) => trade.closed).map((trade) => trade.realizedPnlValue);
+  const stats = closedStatsForPnls(closedPnls);
+  const totalPnl = equityPnl + optionsPnl;
+
+  q("#os-total-pnl").textContent = fmt(totalPnl);
+  q("#os-total-pnl").className = changeClass(totalPnl);
+  q("#os-equity-pnl").textContent = fmt(equityPnl);
+  q("#os-equity-pnl").className = changeClass(equityPnl);
+  q("#os-options-pnl").textContent = fmt(optionsPnl);
+  q("#os-options-pnl").className = changeClass(optionsPnl);
+  q("#os-open-pnl").textContent = fmt(openPnl);
+  q("#os-open-pnl").className = changeClass(openPnl);
+  q("#os-total-trades").textContent = fmt(trades.length, 0);
+  q("#os-win-rate").textContent = Number.isFinite(Number(stats.winRate)) ? pct(stats.winRate) : "-";
+  q("#os-profit-factor").textContent = stats.profitFactorLabel || "-";
+  const maxDd = overallMaxDrawdown(trades);
+  q("#os-max-dd").textContent = fmt(maxDd);
+  q("#os-max-dd").className = maxDd > 0 ? "bad" : "";
+
+  const stockRows = groupOverallRows(
+    trades,
+    (trade) => trade.groupSymbol,
+    (_trade, key) => ({
+      name: key,
+      trades: 0,
+      totalPnl: 0,
+      realizedPnl: 0,
+      unrealizedPnl: 0,
+      equityPnl: 0,
+      optionsPnl: 0,
+      equityTrades: 0,
+      optionsTrades: 0,
+      best: Number.NEGATIVE_INFINITY,
+      worst: Number.POSITIVE_INFINITY,
+      closedPnls: [],
+    }),
+  );
+  q("#overall-stock-count").textContent = stockRows.length ? `${stockRows.length} stocks` : "No stocks";
+  q("#overall-stock-body").innerHTML = stockRows.length ? stockRows.map((row) => `
+    <tr>
+      <td>${safe(row.name)}</td>
+      <td class="${changeClass(row.equityPnl)}">${fmt(row.equityPnl)}</td>
+      <td class="${changeClass(row.optionsPnl)}">${fmt(row.optionsPnl)}</td>
+      <td class="${changeClass(row.totalPnl)}">${fmt(row.totalPnl)}</td>
+      <td>${fmt(row.equityTrades, 0)}</td>
+      <td>${fmt(row.optionsTrades, 0)}</td>
+      <td>${Number.isFinite(Number(row.winRate)) ? pct(row.winRate) : "-"}</td>
+      <td class="${changeClass(row.best)}">${fmt(row.best)}</td>
+      <td class="${changeClass(row.worst)}">${fmt(row.worst)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"9\" class=\"empty-state\">No stockwise P&L for this selection.</td></tr>";
+
+  const thesisRows = groupOverallRows(
+    trades,
+    (trade) => `${trade.segment}|${trade.thesis}`,
+    (trade) => ({
+      segment: trade.segment,
+      thesis: trade.thesis,
+      trades: 0,
+      totalPnl: 0,
+      realizedPnl: 0,
+      unrealizedPnl: 0,
+      equityPnl: 0,
+      optionsPnl: 0,
+      equityTrades: 0,
+      optionsTrades: 0,
+      best: Number.NEGATIVE_INFINITY,
+      worst: Number.POSITIVE_INFINITY,
+      closedPnls: [],
+    }),
+  );
+  q("#overall-thesis-count").textContent = thesisRows.length ? `${thesisRows.length} rows` : "No theses";
+  q("#overall-thesis-body").innerHTML = thesisRows.length ? thesisRows.map((row) => `
+    <tr>
+      <td>${safe(row.segment)}</td>
+      <td>${safe(row.thesis)}</td>
+      <td class="${changeClass(row.totalPnl)}">${fmt(row.totalPnl)}</td>
+      <td>${fmt(row.trades, 0)}</td>
+      <td>${Number.isFinite(Number(row.winRate)) ? pct(row.winRate) : "-"}</td>
+      <td class="${changeClass(row.best)}">${fmt(row.best)}</td>
+      <td class="${changeClass(row.worst)}">${fmt(row.worst)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"7\" class=\"empty-state\">No thesis P&L for this selection.</td></tr>";
+
+  const dailyRows = groupOverallRows(
+    trades,
+    (trade) => trade.accountDate,
+    (_trade, key) => ({
+      date: key,
+      trades: 0,
+      totalPnl: 0,
+      realizedPnl: 0,
+      unrealizedPnl: 0,
+      equityPnl: 0,
+      optionsPnl: 0,
+      equityTrades: 0,
+      optionsTrades: 0,
+      best: Number.NEGATIVE_INFINITY,
+      worst: Number.POSITIVE_INFINITY,
+      closedPnls: [],
+    }),
+  ).sort((left, right) => String(right.date).localeCompare(String(left.date)));
+  q("#overall-daily-count").textContent = dailyRows.length ? `${dailyRows.length} days` : "No days";
+  q("#overall-daily-body").innerHTML = dailyRows.length ? dailyRows.map((row) => `
+    <tr>
+      <td>${safe(row.date)}</td>
+      <td class="${changeClass(row.equityPnl)}">${fmt(row.equityPnl)}</td>
+      <td class="${changeClass(row.optionsPnl)}">${fmt(row.optionsPnl)}</td>
+      <td class="${changeClass(row.totalPnl)}">${fmt(row.totalPnl)}</td>
+      <td>${fmt(row.trades, 0)}</td>
+      <td>${Number.isFinite(Number(row.winRate)) ? pct(row.winRate) : "-"}</td>
+      <td class="${changeClass(row.best)}">${fmt(row.best)}</td>
+      <td class="${changeClass(row.worst)}">${fmt(row.worst)}</td>
+    </tr>
+  `).join("") : "<tr><td colspan=\"8\" class=\"empty-state\">No daily P&L for this selection.</td></tr>";
 }
 
 function renderSettings(status) {
@@ -894,6 +1157,8 @@ function renderStatus(status) {
   renderOptionsPaper(status.options_paper_trading || {});
   renderOptionsPriceTiles(status.options_paper_trading || {});
   renderPaperTradesIndex(status.paper_trading || {});
+  renderOptionsTradesIndex(status.options_paper_trading || {});
+  renderOverallStats(status);
   renderLogs(status.logs || []);
   const liveReport = status.paper_trading?.dailyReport || {};
   if (!state.pnlDate || state.pnlDate === liveReport.date) {
@@ -947,10 +1212,6 @@ q("#stop-btn").addEventListener("click", () => command("/api/stop").catch((err) 
 q("#refresh-btn").addEventListener("click", () => command("/api/refresh").catch((err) => {
   q("#status-line").textContent = err.message;
 }));
-q("#closing-volume-scan-btn").addEventListener("click", () => command("/api/closing-volume/scan").catch((err) => {
-  q("#status-line").textContent = err.message;
-  q("#status-line").className = "bad";
-}));
 q("#paper-pnl-date").addEventListener("change", (event) => {
   const selectedDate = event.target.value;
   state.pnlDate = selectedDate;
@@ -983,6 +1244,36 @@ q("#paper-trades-date").addEventListener("change", (event) => {
   state.paperTradesMode = "date";
   state.paperTradesDate = event.target.value || null;
   renderPaperTradesIndex(state.status?.paper_trading || {});
+});
+q("#options-trades-today").addEventListener("click", () => {
+  state.optionsTradesMode = "today";
+  state.optionsTradesDate = null;
+  renderOptionsTradesIndex(state.status?.options_paper_trading || {});
+});
+q("#options-trades-all").addEventListener("click", () => {
+  state.optionsTradesMode = "all";
+  state.optionsTradesDate = null;
+  renderOptionsTradesIndex(state.status?.options_paper_trading || {});
+});
+q("#options-trades-date").addEventListener("change", (event) => {
+  state.optionsTradesMode = "date";
+  state.optionsTradesDate = event.target.value || null;
+  renderOptionsTradesIndex(state.status?.options_paper_trading || {});
+});
+q("#overall-today").addEventListener("click", () => {
+  state.overallMode = "today";
+  state.overallDate = null;
+  renderOverallStats(state.status || {});
+});
+q("#overall-all").addEventListener("click", () => {
+  state.overallMode = "all";
+  state.overallDate = null;
+  renderOverallStats(state.status || {});
+});
+q("#overall-date").addEventListener("change", (event) => {
+  state.overallMode = "date";
+  state.overallDate = event.target.value || null;
+  renderOverallStats(state.status || {});
 });
 
 document.addEventListener("click", (event) => {

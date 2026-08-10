@@ -94,82 +94,22 @@ MARKET_CLOSE_TIME = dt.time(15, 31)
 
 SECTOR_PICK_COUNT = 2
 STOCKS_PER_SECTOR = 5
-BUY_SECTOR_THRESHOLD = 0.5
-SELL_SECTOR_THRESHOLD = -0.5
+BUY_SECTOR_THRESHOLD = 0.05
+SELL_SECTOR_THRESHOLD = -0.05
 
 PAPER_INITIAL_CAPITAL = 1_000_000.0
 PAPER_TRADE_ALLOCATION = 50_000.0
 M5_SECONDS = 300
 FRESH_CONFIRMATION_SECONDS = 10
 VWAP_RETEST_TOLERANCE = 0.003
-SECTOR_MOMENTUM_BREAKOUT_BUFFER = 0.001
-SECTOR_MOMENTUM_TARGET_RR = 2.0
-SECTOR_MOMENTUM_MAX_RISK_PCT = 0.006
-SECTOR_MOMENTUM_MAX_ENTRY_EXTENSION = 0.0015
-SECTOR_MOMENTUM_RUNNER_ENABLED = True
-SECTOR_MOMENTUM_PARTIAL_EXIT_RR = 2.0
-SECTOR_MOMENTUM_PARTIAL_EXIT_PCT = 0.50
-SECTOR_MOMENTUM_RUNNER_SL_LOCK_RR = 0.25
 PAPER_START_HOUR = 9
-PAPER_START_MINUTE = 15
+PAPER_START_MINUTE = 20
 PAPER_SQUARE_OFF_HOUR = 15
 PAPER_SQUARE_OFF_MINUTE = 13
-DAILY_STOCK_SL_LIMIT = 6
-MIN_TRADE_RR = 1.5
+DAILY_STOCK_SL_LIMIT = 4
 PAPER_MOVE_SL_TO_BE = False
 PAPER_BE_TRIGGER_RR = 2.0
 PAPER_BE_LOCK_RR = 0.20
-CLOSING_VOLUME_LOOKBACK_DAYS = int(os.getenv("CLOSING_VOLUME_LOOKBACK_DAYS", "20") or "20")
-CLOSING_VOLUME_UNIVERSE = os.getenv("CLOSING_VOLUME_UNIVERSE", "NIFTY 500").strip() or "NIFTY 500"
-CLOSING_VOLUME_TOP_COUNT = int(os.getenv("CLOSING_VOLUME_TOP_COUNT", "5") or "5")
-CLOSING_VOLUME_MAX_TRADES = int(os.getenv("CLOSING_VOLUME_MAX_TRADES", "10") or "10")
-CLOSING_VOLUME_SPIKE_MULTIPLE = float(os.getenv("CLOSING_VOLUME_SPIKE_MULTIPLE", "2.50") or "2.50")
-CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT = float(os.getenv("CLOSING_VOLUME_MIN_DAILY_VOLUME_PCT", "0.05") or "0.05")
-CLOSING_VOLUME_MIN_BODY_PCT = float(os.getenv("CLOSING_VOLUME_MIN_BODY_PCT", "0.0015") or "0.0015")
-CLOSING_VOLUME_ENTRY_WINDOW_MINUTES = int(os.getenv("CLOSING_VOLUME_ENTRY_WINDOW_MINUTES", "5") or "5")
-CLOSING_VOLUME_MAX_RISK_PCT = float(os.getenv("CLOSING_VOLUME_MAX_RISK_PCT", "0.006") or "0.006")
-CLOSING_VOLUME_TARGET_RR = float(os.getenv("CLOSING_VOLUME_TARGET_RR", "2.0") or "2.0")
-
-# Editable defaults (change these values directly in config.py):
-# - PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT
-#     When True, confirmations are considered valid from the candle start
-#     (allows acting on a still-forming M5 candle). When False, confirmations
-#     are only valid after the candle completes.
-# - PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT
-#     When True, the same M5 confirmation may trigger multiple trades (old behaviour).
-#     When False, each confirmation is marked used and won't trigger new trades.
-PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT = True
-PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT = True
-
-# Environment-aware parsing helper. If you prefer env vars, set the literal
-# strings 'true' or 'false' (case-insensitive). If unset or invalid, the
-# defaults above are used.
-def _env_bool_strict(key: str, default: bool = False) -> bool:
-    """Parse an env var that must be the literal string 'true' or 'false'.
-
-    Any other value (including '1' or '0') falls back to the provided default.
-    """
-    val = os.getenv(key)
-    if val is None:
-        return default
-    s = str(val).strip().lower()
-    if s == "true":
-        return True
-    if s == "false":
-        return False
-    return default
-
-# Final effective toggles (editable via the DEFAULT constants above or
-# overridden at runtime with env vars PAPER_ALLOW_INFLIGHT_CONFIRMATIONS and
-# PAPER_ALLOW_CONFIRMATION_REUSE set to 'true' or 'false').
-PAPER_ALLOW_INFLIGHT_CONFIRMATIONS = _env_bool_strict(
-    "PAPER_ALLOW_INFLIGHT_CONFIRMATIONS", PAPER_ALLOW_INFLIGHT_CONFIRMATIONS_DEFAULT
-)
-
-# Allow re-using the same M5 confirmation for multiple trades (old behaviour).
-PAPER_ALLOW_CONFIRMATION_REUSE = _env_bool_strict(
-    "PAPER_ALLOW_CONFIRMATION_REUSE", PAPER_ALLOW_CONFIRMATION_REUSE_DEFAULT
-)
 
 NIFTY_OPTIONS_INITIAL_CAPITAL = 500_000.0
 NIFTY_OPTIONS_TRADE_ALLOCATION = float(os.getenv("NIFTY_OPTIONS_TRADE_ALLOCATION", "50000") or "50000")
@@ -195,6 +135,10 @@ OPENING_MOVER_OPTIONS_ENTRY_HOUR = int(os.getenv("OPENING_MOVER_OPTIONS_ENTRY_HO
 OPENING_MOVER_OPTIONS_ENTRY_MINUTE = int(os.getenv("OPENING_MOVER_OPTIONS_ENTRY_MINUTE", "15") or "15")
 OPENING_MOVER_OPTIONS_ENTRY_SECOND = int(os.getenv("OPENING_MOVER_OPTIONS_ENTRY_SECOND", "30") or "30")
 OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS = int(os.getenv("OPENING_MOVER_OPTIONS_ENTRY_WINDOW_SECONDS", "30") or "30")
+OPENING_MOVER_OPTIONS_PLACE_HOUR = int(os.getenv("OPENING_MOVER_OPTIONS_PLACE_HOUR", "9") or "9")
+OPENING_MOVER_OPTIONS_PLACE_MINUTE = int(os.getenv("OPENING_MOVER_OPTIONS_PLACE_MINUTE", "20") or "20")
+OPENING_MOVER_OPTIONS_PLACE_SECOND = int(os.getenv("OPENING_MOVER_OPTIONS_PLACE_SECOND", "0") or "0")
+OPENING_MOVER_OPTIONS_PLACE_WINDOW_SECONDS = int(os.getenv("OPENING_MOVER_OPTIONS_PLACE_WINDOW_SECONDS", "30") or "30")
 OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES = int(os.getenv("OPENING_MOVER_OPTIONS_MAX_HOLD_MINUTES", "15") or "15")
 OPENING_MOVER_OPTIONS_TOP_COUNT = int(os.getenv("OPENING_MOVER_OPTIONS_TOP_COUNT", "5") or "5")
 OPENING_MOVER_OPTIONS_MAX_TRADES = int(os.getenv("OPENING_MOVER_OPTIONS_MAX_TRADES", "6") or "6")

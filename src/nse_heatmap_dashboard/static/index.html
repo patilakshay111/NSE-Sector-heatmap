@@ -26,14 +26,20 @@
       </div>
     </div>
     <nav>
-      <button class="nav active" data-view="dashboard">Dashboard</button>
-      <button class="nav" data-view="heatmap">Sector Heatmap</button>
-      <button class="nav" data-view="indices">All Sectors</button>
+      <button class="nav active" data-view="dashboard">Market Overview</button>
+      <button class="nav" data-view="heatmap">Heatmap</button>
+      <button class="nav" data-view="indices">Sector Indices</button>
       <button class="nav" data-view="sector-stocks">Sector Stocks</button>
-      <button class="nav" data-view="options-paper">Index Options</button>
-      <button class="nav" data-view="paper-dashboard">Paper Dashboard</button>
-      <button class="nav" data-view="paper-trades">Paper Trades</button>
-      <button class="nav" data-view="paper-pnl">Paper PnL</button>
+      <div class="nav-separator"></div>
+      <button class="nav" data-view="paper-dashboard">Equity Paper</button>
+      <button class="nav" data-view="paper-trades">Equity Trades</button>
+      <button class="nav" data-view="paper-pnl">Equity P&L</button>
+      <div class="nav-separator"></div>
+      <button class="nav" data-view="options-paper">Options Paper</button>
+      <button class="nav" data-view="options-trades">Options Trades</button>
+      <div class="nav-separator"></div>
+      <button class="nav" data-view="overall-stats">Overall Stats</button>
+      <div class="nav-separator"></div>
       <button class="nav" data-view="logs">Logs</button>
       <button class="nav" data-view="settings">Settings</button>
     </nav>
@@ -43,7 +49,7 @@
   <main>
     <header class="topbar">
       <div>
-        <h1 id="page-title">Dashboard</h1>
+        <h1 id="page-title">Market Overview</h1>
         <p id="status-line">Loading NSE stream...</p>
       </div>
       <div class="actions">
@@ -172,26 +178,6 @@
 
       <div class="panel paper-panel">
         <div class="panel-head">
-          <h2>Closing Volume Shortlist</h2>
-          <div class="panel-head-actions">
-            <span id="closing-volume-status">-</span>
-            <button id="closing-volume-scan-btn" class="ghost" type="button" disabled>Scan NIFTY 500</button>
-          </div>
-        </div>
-        <div class="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>Stock</th><th>Side</th><th>Trend</th><th>Final 15m</th><th>Volume</th><th>Delivery</th><th>Futures OI</th><th>Read</th><th>Score</th>
-              </tr>
-            </thead>
-            <tbody id="closing-volume-body"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="panel paper-panel">
-        <div class="panel-head">
           <h2>Active Trades</h2>
           <span>50,000 allocation</span>
         </div>
@@ -287,6 +273,118 @@
             </thead>
             <tbody id="options-closed-body"></tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="options-trades" class="view">
+      <div class="panel report-toolbar">
+        <button id="options-trades-today" type="button">Today</button>
+        <button id="options-trades-all" type="button">All</button>
+        <label for="options-trades-date">
+          <span>Trade Day</span>
+          <input id="options-trades-date" type="date" />
+        </label>
+      </div>
+
+      <div class="paper-summary">
+        <article class="metric"><span>Total Trades</span><strong id="ot-total">-</strong></article>
+        <article class="metric"><span>Active</span><strong id="ot-active">-</strong></article>
+        <article class="metric"><span>Closed</span><strong id="ot-closed">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="ot-win-rate">-</strong></article>
+        <article class="metric"><span>Total P/L</span><strong id="ot-pnl">-</strong></article>
+        <article class="metric"><span>Max DD</span><strong id="ot-max-dd">-</strong></article>
+      </div>
+
+      <div class="panel paper-panel">
+        <div class="panel-head">
+          <h2>Options Trades</h2>
+          <span id="options-trades-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Trade</th><th>Contract</th><th>Underlying</th><th>Thesis</th><th>Entry Time</th><th>Entry</th><th>Current/Exit</th><th>SL</th><th>TP</th><th>Qty</th><th>Range</th><th>Exit</th><th>P/L</th>
+              </tr>
+            </thead>
+            <tbody id="all-options-trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="overall-stats" class="view">
+      <div class="panel report-toolbar">
+        <button id="overall-today" type="button">Today</button>
+        <button id="overall-all" type="button">All</button>
+        <label for="overall-date">
+          <span>Report Day</span>
+          <input id="overall-date" type="date" />
+        </label>
+      </div>
+
+      <div class="paper-summary overall-summary">
+        <article class="metric"><span>Total P&L</span><strong id="os-total-pnl">-</strong></article>
+        <article class="metric"><span>Equity P&L</span><strong id="os-equity-pnl">-</strong></article>
+        <article class="metric"><span>Options P&L</span><strong id="os-options-pnl">-</strong></article>
+        <article class="metric"><span>Open P&L</span><strong id="os-open-pnl">-</strong></article>
+        <article class="metric"><span>Total Trades</span><strong id="os-total-trades">-</strong></article>
+        <article class="metric"><span>Win Rate</span><strong id="os-win-rate">-</strong></article>
+        <article class="metric"><span>Profit Factor</span><strong id="os-profit-factor">-</strong></article>
+        <article class="metric"><span>Max Drawdown</span><strong id="os-max-dd">-</strong></article>
+      </div>
+
+      <div class="panel report-panel">
+        <div class="panel-head">
+          <h2>Stockwise P&L</h2>
+          <span id="overall-stock-count">-</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Stock</th><th>Equity P&L</th><th>Options P&L</th><th>Total P&L</th><th>Equity Trades</th><th>Options Trades</th><th>Win Rate</th><th>Best</th><th>Worst</th>
+              </tr>
+            </thead>
+            <tbody id="overall-stock-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="report-grid overall-grid">
+        <div class="panel report-panel">
+          <div class="panel-head">
+            <h2>Thesis P&L</h2>
+            <span id="overall-thesis-count">-</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Segment</th><th>Thesis</th><th>Total P&L</th><th>Trades</th><th>Win Rate</th><th>Best</th><th>Worst</th>
+                </tr>
+              </thead>
+              <tbody id="overall-thesis-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel report-panel">
+          <div class="panel-head">
+            <h2>Daily P&L</h2>
+            <span id="overall-daily-count">-</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th><th>Equity</th><th>Options</th><th>Total</th><th>Trades</th><th>Win Rate</th><th>Best</th><th>Worst</th>
+                </tr>
+              </thead>
+              <tbody id="overall-daily-body"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </section>
