@@ -9,6 +9,9 @@
 [![GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-gray?logo=github-actions)](https://github.com/features/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
+<img width="2752" height="1536" alt="Gemini_Generated_Image_jhsd3kjhsd3kjhsd" src="https://github.com/user-attachments/assets/f8373f8e-8dd2-464d-bf2b-02e497854484" />
+
+
 Local operator dashboard for NSE live market index heatmap monitoring.
 
 ## Start
